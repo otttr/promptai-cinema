@@ -428,4 +428,30 @@ document.querySelectorAll('a[href="#apiSettings"]').forEach((link) => { link.add
 document.querySelectorAll('.gallery-item').forEach((item) => { item.addEventListener('click', () => { ideaInput.value = item.dataset.idea || ''; ideaInput.dispatchEvent(new Event('input')); $('#generatore').scrollIntoView({ behavior: 'smooth', block: 'center' }); ideaInput.focus({ preventScroll: true }); toast('Idea caricata: scegli lo stile e genera il prompt.'); }); });
 if ('IntersectionObserver' in window) { const observer = new IntersectionObserver((entries) => { entries.forEach((entry) => { if (entry.isIntersecting) { entry.target.classList.add('visible'); observer.unobserve(entry.target); } }); }, { threshold: 0.12 });
 document.querySelectorAll('.reveal').forEach((el) => observer.observe(el)); } else { document.querySelectorAll('.reveal').forEach((el) => el.classList.add('visible')); }
-/* ============================================================ INIT ============================================================ */ $('#year').textContent = new Date().getFullYear(); renderHistory(); loadApiSettings(); })(); </script></body></html><script defer src="/_vercel/insights/script.js"></script>
+/* ============================================================ INIT ============================================================ */ $('#year').textContent = new Date().getFullYear(); renderHistory(); loadApiSettings(); })(); </script><script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+window.addEventListener('load',()=>{
+  const h1=document.querySelector('h1');
+  if(!h1) return;
+  const el=document.createElement('div');
+  el.style.cssText='width:100%;height:240px;margin:0 auto';
+  h1.parentNode.insertBefore(el,h1);
+  const scene=new THREE.Scene();
+  const cam=new THREE.PerspectiveCamera(45,el.clientWidth/el.clientHeight,0.1,100);
+  cam.position.z=5;
+  const r=new THREE.WebGLRenderer({alpha:true,antialias:true});
+  r.setSize(el.clientWidth,el.clientHeight);
+  r.setPixelRatio(Math.min(devicePixelRatio,2));
+  el.appendChild(r.domElement);
+  const a=new THREE.Mesh(new THREE.TorusKnotGeometry(1,0.3,120,16),
+    new THREE.MeshBasicMaterial({color:0x22d3ee,wireframe:true}));
+  const b=new THREE.Mesh(new THREE.IcosahedronGeometry(0.5,1),
+    new THREE.MeshBasicMaterial({color:0xf472b6,wireframe:true}));
+  scene.add(a,b);
+  (function loop(){
+    a.rotation.x+=0.006; a.rotation.y+=0.01;
+    b.rotation.y-=0.015;
+    r.render(scene,cam); requestAnimationFrame(loop);
+  })();
+});
+</script></body></html><script defer src="/_vercel/insights/script.js"></script>
