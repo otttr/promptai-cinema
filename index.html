@@ -459,14 +459,11 @@ const a=new THREE.Mesh(g,
 a.add(new THREE.LineSegments(new THREE.EdgesGeometry(g),
   new THREE.LineBasicMaterial({color:0xc4b5fd}))); 
   
-  const b=new THREE.Mesh(new THREE.IcosahedronGeometry(0.5,1),
-  new THREE.MeshBasicMaterial({color:0x3b82f6}));
-b.add(new THREE.LineSegments(new THREE.EdgesGeometry(b.geometry),
-  new THREE.LineBasicMaterial({color:0xbfdbfe})));
-  scene.add(a,b);
+  
+  scene.add(a);
   (function loop(){
     a.rotation.y+=0.01;
-    b.rotation.y-=0.015;
+  
     r.render(scene,cam); requestAnimationFrame(loop);
   })();
 });
