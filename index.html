@@ -444,9 +444,9 @@ window.addEventListener('load',()=>{
   r.setPixelRatio(Math.min(devicePixelRatio,2));
   el.appendChild(r.domElement);
   const a=new THREE.Mesh(new THREE.TorusKnotGeometry(1,0.3,120,16),
-    new THREE.MeshBasicMaterial({color:0x22d3ee,wireframe:true}));
+    new THREE.MeshBasicMaterial({color:0x8b5cf6,wireframe:true}));
   const b=new THREE.Mesh(new THREE.IcosahedronGeometry(0.5,1),
-    new THREE.MeshBasicMaterial({color:0xf472b6,wireframe:true}));
+    new THREE.MeshBasicMaterial({color:0xfbbf24,wireframe:true}));
   scene.add(a,b);
   (function loop(){
     a.rotation.x+=0.006; a.rotation.y+=0.01;
