@@ -455,7 +455,9 @@ s.holes.push(h);
 const g=new THREE.ExtrudeGeometry(s,{depth:0.5,bevelEnabled:false});
 g.center();
 const a=new THREE.Mesh(g,
-  new THREE.MeshBasicMaterial({color:0x8b5cf6,wireframe:true})); 
+  new THREE.MeshBasicMaterial({color:0x5b21b6}));
+a.add(new THREE.LineSegments(new THREE.EdgesGeometry(g),
+  new THREE.LineBasicMaterial({color:0xc4b5fd}))); 
   
   const b=new THREE.Mesh(new THREE.IcosahedronGeometry(0.5,1),
     new THREE.MeshBasicMaterial({color:0xfbbf24,wireframe:true}));
