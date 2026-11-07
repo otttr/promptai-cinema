@@ -454,14 +454,56 @@ h.lineTo(0.5,2.55); h.lineTo(0.5,1.95);
 s.holes.push(h);
 const g=new THREE.ExtrudeGeometry(s,{depth:0.5,bevelEnabled:false});
 g.center();
-const a=new THREE.Mesh(g,[
-  new THREE.MeshBasicMaterial({color:0x5b21b6}),
-  new THREE.MeshBasicMaterial({color:0xc4b5fd})
+const a = new THREE.Mesh(g, [
+  new THREE.MeshStandardMaterial({
+    color: 0x5b21b6,        // Viola scuro
+    metalness: 0.85,         // Effetto metallico
+    roughness: 0.1,          // Molto lucido e brillante
+    emissive: 0x1a1030,      // Bagliore leggero
+    emissiveIntensity: 0.15
+  }),
+  new THREE.MeshStandardMaterial({
+    color: 0xc4b5fd,        // Viola chiaro
+    metalness: 0.85,
+    roughness: 0.1,
+    emissive: 0x2a2040,      // Bagliore leggero
+    emissiveIntensity: 0.15
+  })
 ]);
+
+  new THREE.MeshStandardMaterial({ 
+    color: 0xc4b5fd,    // 💜 Viola chiaro
+    metalness: 0.85,
+    roughness: 0.1,
+    emissive: 0x2a2040,
+    emissiveIntensity: 0.15
+  })
+]);
+
 a.add(new THREE.LineSegments(new THREE.EdgesGeometry(g),
   new THREE.LineBasicMaterial({color:0x000000})));
  
-  
+ a.add(new THREE.LineSegments(new THREE.EdgesGeometry(g),
+new THREE.LineBasicMaterial({color:0x000000})));
+
+// ✅ INCOLLA QUI SOTTO IL CODICE DELLA LUCE ✅
+
+// 💡 Luce principale
+const luce1 = new THREE.DirectionalLight(0xffffff, 1.5);
+luce1.position.set(5, 10, 7);
+scene.add(luce1);
+
+// 💡 Luce secondaria viola
+const luce2 = new THREE.DirectionalLight(0xc4b5fd, 0.6);
+luce2.position.set(-5, 5, -5);
+scene.add(luce2);
+
+// 💡 Luce ambientale
+const luceAmbientale = new THREE.AmbientLight(0xffffff, 0.5);
+scene.add(luceAmbientale);
+
+scene.add(a);
+ 
   
   scene.add(a);
   (function loop(){
