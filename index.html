@@ -455,37 +455,21 @@ s.holes.push(h);
 const g=new THREE.ExtrudeGeometry(s,{depth:0.5,bevelEnabled:false});
 g.center();
 const a = new THREE.Mesh(g, [
-  new THREE.MeshStandardMaterial({
-    color: 0x5b21b6,        // Viola scuro
-    metalness: 0.85,         // Effetto metallico
-    roughness: 0.1,          // Molto lucido e brillante
-    emissive: 0x1a1030,      // Bagliore leggero
-    emissiveIntensity: 0.15
+  new THREE.MeshPhongMaterial({ 
+    color: 0x5b21b6,    // 🟣 Viola scuro
+    shininess: 200,      // ✨ Molto lucido
+    specular: 0x7766ee   // 💎 Bagliore viola
   }),
-  new THREE.MeshStandardMaterial({
-    color: 0xc4b5fd,        // Viola chiaro
-    metalness: 0.85,
-    roughness: 0.1,
-    emissive: 0x2a2040,      // Bagliore leggero
-    emissiveIntensity: 0.15
-  })
-]);
-
-  new THREE.MeshStandardMaterial({ 
+  new THREE.MeshPhongMaterial({ 
     color: 0xc4b5fd,    // 💜 Viola chiaro
-    metalness: 0.85,
-    roughness: 0.1,
-    emissive: 0x2a2040,
-    emissiveIntensity: 0.15
+    shininess: 200,
+    specular: 0x9988ff
   })
 ]);
 
 a.add(new THREE.LineSegments(new THREE.EdgesGeometry(g),
   new THREE.LineBasicMaterial({color:0x000000})));
  
- a.add(new THREE.LineSegments(new THREE.EdgesGeometry(g),
-new THREE.LineBasicMaterial({color:0x000000})));
-
 // ✅ INCOLLA QUI SOTTO IL CODICE DELLA LUCE ✅
 
 // 💡 Luce principale
