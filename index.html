@@ -460,7 +460,9 @@ a.add(new THREE.LineSegments(new THREE.EdgesGeometry(g),
   new THREE.LineBasicMaterial({color:0xc4b5fd}))); 
   
   const b=new THREE.Mesh(new THREE.IcosahedronGeometry(0.5,1),
-    new THREE.MeshBasicMaterial({color:0xfbbf24,wireframe:true}));
+  new THREE.MeshBasicMaterial({color:0x3b82f6}));
+b.add(new THREE.LineSegments(new THREE.EdgesGeometry(b.geometry),
+  new THREE.LineBasicMaterial({color:0xbfdbfe})));
   scene.add(a,b);
   (function loop(){
     a.rotation.y+=0.01;
