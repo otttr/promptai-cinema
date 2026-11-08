@@ -1,12 +1,4 @@
-<!DOCTYPE html><html lang="it"><head><!-- Google tag (gtag.js) -->
-<script async src="https://www.googletagmanager.com/gtag/js?id=G-3G1QY5R49T"></script>
-<script>
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){dataLayer.push(arguments);}
-  gtag('js', new Date());
-
-  gtag('config', 'G-3G1QY5R49T');
-</script><!-- Sfondo animato Shader -->
+<!DOCTYPE html><html lang="it"><head><!-- Sfondo animato Shader -->
 <canvas id="shader-canvas" style="
   position: fixed;
   top: 0;
@@ -328,19 +320,11 @@ section { padding: 50px 0; }
 .toast-wrap { left: 16px; right: 16px; bottom: 16px; } }
 @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; }
 *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
-.reveal { opacity: 1; transform: none; } }.hx-hero{position:relative;width:100%;min-height:70vh;padding:110px 24px 90px;text-align:center;overflow:hidden;border-radius:0 0 18px 18px;background:linear-gradient(to bottom,rgba(0,0,0,.55),transparent 35%,rgba(0,212,255,.10) 100%);isolation:isolate}
-.hx-title{font-family:Georgia,"Times New Roman",serif;font-weight:500;letter-spacing:-.02em;background:none;-webkit-text-fill-color:#fff;color:#fff}
-.hx-btn{background:#2563eb;color:#fff;border-radius:999px;padding:16px 36px}
-@media (max-width:640px){.hx-btn{display:block;max-width:520px;margin:0 auto}}
-.hx-models small{width:100%;font-weight:400;opacity:.8} </style></head><body> <a class="skip-link" href="#generatore">Salta al generatore</a> <div class="matrix-bg" aria-hidden="true"></div> <div class="glow" aria-hidden="true"></div>
+.reveal { opacity: 1; transform: none; } } </style></head><body> <a class="skip-link" href="#generatore">Salta al generatore</a> <div class="matrix-bg" aria-hidden="true"></div> <div class="glow" aria-hidden="true"></div>
 <header> <div class="container header-inner"> <a class="logo" href="#top"> <span class="logo-mark" aria-hidden="true">P</span> PromptAI Cinema </a>
 <button class="mobile-toggle" id="mobileToggle" aria-label="Apri il menu" aria-expanded="false" aria-controls="navLinks">☰</button>
 <nav class="nav-links" id="navLinks" aria-label="Navigazione principale"> <a href="#generatore">Generatore</a> <a href="#galleria">Galleria</a> <a href="#funzioni">Funzioni</a> <a href="#prezzi">Prezzi</a> <a class="instagram-icon" href="https://www.instagram.com/" target="_blank" rel="noopener" aria-label="Seguici su Instagram"> <svg viewBox="0 0 24 24" aria-hidden="true"> <rect x="3" y="3" width="18" height="18" rx="5"></rect> <circle cx="12" cy="12" r="4"></circle> <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"></circle> </svg> </a> <button class="btn-accedi" id="loginBtn" type="button">Accedi</button> </nav> </div> </header>
-<main id="top"><section class="hx-hero" aria-labelledby="hx-title">
-  <a href="#generatore" class="hx-eyebrow">Prompt cinematografici con AI
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
-  </a>
-</section> <div class="container"> <!-- HERO --> <section class="hero" aria-labelledby="heroTitle"> <div class="badge"> <span class="dot" aria-hidden="true"></span> Generatore di prompt cinematografici con IA </div> <h1 id="heroTitle"> Dalla tua idea al<br> <span class="gradient-text">prompt cinematografico</span> </h1> <p> Descrivi una scena in italiano. PromptAI Cinema la trasforma in un prompt professionale — inquadratura, lenti, luce, color grading — pronto per Sora, Runway, Kling, Veo e Midjourney. </p>
+<main id="top"> <div class="container"> <!-- HERO --> <section class="hero" aria-labelledby="heroTitle"> <div class="badge"> <span class="dot" aria-hidden="true"></span> Generatore di prompt cinematografici con IA </div> <h1 id="heroTitle"> Dalla tua idea al<br> <span class="gradient-text">prompt cinematografico</span> </h1> <p> Descrivi una scena in italiano. PromptAI Cinema la trasforma in un prompt professionale — inquadratura, lenti, luce, color grading — pronto per Sora, Runway, Kling, Veo e Midjourney. </p>
 <div class="generator-box" id="generatore"> <form id="promptForm" novalidate> <label class="field-label" for="idea">La tua idea</label> <textarea id="idea" name="idea" maxlength="600" placeholder="Es. Un faro isolato durante una tempesta, una donna in impermeabile giallo guarda il mare in tempesta..." aria-describedby="charCount" ></textarea> <div class="char-count" id="charCount">0 / 600</div>
 <div class="generator-grid"> <div class="field"> <label class="field-label" for="style">Stile visivo</label> <select id="style" name="style"> <option value="cinematico">Cinematografico</option> <option value="noir">Noir in bianco e nero</option> <option value="scifi">Sci-fi / Cyberpunk</option> <option value="horror">Horror</option> <option value="documentario">Documentario</option> <option value="anime">Anime</option> <option value="vintage">Vintage Super 8</option> <option value="fantasy">Fantasy epico</option> </select> </div> <div class="field"> <label class="field-label" for="ratio">Formato</label> <select id="ratio" name="ratio"> <option value="16:9">16:9 — Orizzontale</option> <option value="9:16">9:16 — Verticale / Reels</option> <option value="2.39:1">2.39:1 — CinemaScope</option> <option value="4:3">4:3 — Vintage</option> <option value="1:1">1:1 — Quadrato</option> </select> </div> </div>
 <button class="btn-trasforma" id="generateBtn" type="submit"> <span class="spinner" aria-hidden="true"></span> <span id="generateLabel">Trasforma in prompt</span> </button>
@@ -459,54 +443,16 @@ window.addEventListener('load',()=>{
   r.setSize(el.clientWidth,el.clientHeight);
   r.setPixelRatio(Math.min(devicePixelRatio,2));
   el.appendChild(r.domElement);
- const s=new THREE.Shape();
-s.moveTo(0,0); s.lineTo(0,3); s.lineTo(1.2,3);
-s.absarc(1.2,2.25,0.75,Math.PI/2,-Math.PI/2,true);
-s.lineTo(0.5,1.5); s.lineTo(0.5,0); s.lineTo(0,0);
-const h=new THREE.Path();
-h.moveTo(0.5,1.95); h.lineTo(1.2,1.95);
-h.absarc(1.2,2.25,0.3,-Math.PI/2,Math.PI/2,false);
-h.lineTo(0.5,2.55); h.lineTo(0.5,1.95);
-s.holes.push(h);
-const g=new THREE.ExtrudeGeometry(s,{depth:0.5,bevelEnabled:false});
-g.center();
-const a = new THREE.Mesh(g, [
-  new THREE.MeshPhongMaterial({ 
-    color: 0x5b21b6,    // 🟣 Viola scuro
-    shininess: 200,      // ✨ Molto lucido
-    specular: 0x7766ee   // 💎 Bagliore viola
-  }),
-  new THREE.MeshPhongMaterial({ 
-    color: 0xc4b5fd,    // 💜 Viola chiaro
-    shininess: 200,
-    specular: 0x9988ff
-  })
-]);
-
-a.add(new THREE.LineSegments(new THREE.EdgesGeometry(g),
-  new THREE.LineBasicMaterial({color:0x000000})));
- 
-// ✅ INCOLLA QUI SOTTO IL CODICE DELLA LUCE ✅
-
-// 💡 Luce principale
-const luce1 = new THREE.DirectionalLight(0xffffff, 1.5);
-luce1.position.set(5, 10, 7);
-scene.add(luce1);
-
-// 💡 Luce secondaria viola
-const luce2 = new THREE.DirectionalLight(0xc4b5fd, 0.6);
-luce2.position.set(-5, 5, -5);
-scene.add(luce2);
-
-// 💡 Luce ambientale
-const luceAmbientale = new THREE.AmbientLight(0xffffff, 0.5);
-scene.add(luceAmbientale);
-
-  scene.add(a);
+  const a=new THREE.Mesh(new THREE.TorusKnotGeometry(1,0.3,120,16),
+    new THREE.MeshBasicMaterial({color:0x22d3ee,wireframe:true}));
+  const b=new THREE.Mesh(new THREE.IcosahedronGeometry(0.5,1),
+    new THREE.MeshBasicMaterial({color:0xf472b6,wireframe:true}));
+  scene.add(a,b);
   (function loop(){
-    a.rotation.y+=0.01;
-  
+    a.rotation.x+=0.006; a.rotation.y+=0.01;
+    b.rotation.y-=0.015;
     r.render(scene,cam); requestAnimationFrame(loop);
   })();
 });
 </script></body></html><script defer src="/_vercel/insights/script.js"></script>
+
