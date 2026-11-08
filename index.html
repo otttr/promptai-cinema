@@ -1,469 +1,171 @@
-<!DOCTYPE html><html lang="it"><head><!-- Google tag (gtag.js) -->
-<script async src="https://www.googletagmanager.com/gtag/js?id=G-3G1QY5R49T"></script>
-<script>
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){dataLayer.push(arguments);}
-  gtag('js', new Date());
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-361QY5R49T"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-361QY5R49T');
+    </script>
+</head>
+<body>
 
-  gtag('config', 'G-3G1QY5R49T');
-</script>
-<!DOCTYPE html><html lang="it"><head><!-- Sfondo animato Shader -->
-<canvas id="shader-canvas" style="
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 100vw;
-  height: 100vh;
-  z-index: -1;
-"></canvas>
+    <!-- Sfondo animato Shader WebGL -->
+    <canvas id="shader-canvas" style="
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      z-index: -1;
+    "></canvas>
 
-<script>
-const canvas = document.getElementById('shader-canvas');
-const gl = canvas.getContext('webgl');
+    <script>
+    const canvas = document.getElementById('shader-canvas');
+    const gl = canvas.getContext('webgl');
 
-if (gl) {
-  const vsSource = `
-    attribute vec4 aVertexPosition;
-    void main() { gl_Position = aVertexPosition; }
-  `;
+    if (gl) {
+      const vsSource = `
+        attribute vec4 aVertexPosition;
+        void main() { gl_Position = aVertexPosition; }
+      `;
 
-  const fsSource = `
-    precision highp float;
-    uniform vec2 iResolution;
-    uniform float iTime;
+      const fsSource = `
+        precision highp float;
+        uniform vec2 iResolution;
+        uniform float iTime;
 
-    const float overallSpeed = 0.2;
-    const float gridSmoothWidth = 0.015;
-    const float axisWidth = 0.05;
-    const float majorLineWidth = 0.025;
-    const float minorLineWidth = 0.0125;
-    const float majorLineFrequency = 5.0;
-    const float minorLineFrequency = 1.0;
-    const float scale = 5.0;
-    const vec4 lineColor = vec4(0.4, 0.2, 0.8, 1.0);
-    const float minLineWidth = 0.01;
-    const float maxLineWidth = 0.2;
-    const float lineSpeed = 1.0 * overallSpeed;
-    const float lineAmplitude = 1.0;
-    const float lineFrequency = 0.2;
-    const float warpSpeed = 0.2 * overallSpeed;
-    const float warpFrequency = 0.5;
-    const float warpAmplitude = 1.0;
-    const float offsetFrequency = 0.5;
-    const float offsetSpeed = 1.33 * overallSpeed;
-    const float minOffsetSpread = 0.6;
-    const float maxOffsetSpread = 2.0;
-    const int linesPerGroup = 16;
+        const float overallSpeed = 0.2;
+        const float gridSmoothWidth = 0.015;
+        const float scale = 5.0;
+        const vec4 lineColor = vec4(0.4, 0.2, 0.8, 1.0);
+        const float minLineWidth = 0.01;
+        const float maxLineWidth = 0.2;
+        const float lineSpeed = 1.0 * overallSpeed;
+        const float lineAmplitude = 1.0;
+        const float lineFrequency = 0.2;
+        const float warpSpeed = 0.2 * overallSpeed;
+        const float warpFrequency = 0.5;
+        const float warpAmplitude = 1.0;
+        const float offsetFrequency = 0.5;
+        const float offsetSpeed = 1.33 * overallSpeed;
+        const float minOffsetSpread = 0.6;
+        const float maxOffsetSpread = 2.0;
+        const int linesPerGroup = 16;
 
-    #define drawCircle(pos, radius, coord) smoothstep(radius + gridSmoothWidth, radius, length(coord - (pos)))
-    #define drawSmoothLine(pos, halfWidth, t) smoothstep(halfWidth, 0.0, abs(pos - (t)))
-    #define drawCrispLine(pos, halfWidth, t) smoothstep(halfWidth + gridSmoothWidth, halfWidth, abs(pos - (t)))
-    #define drawPeriodicLine(freq, width, t) drawCrispLine(freq / 2.0, width, abs(mod(t, freq) - (freq) / 2.0))
+        #define drawCircle(pos, radius, coord) smoothstep(radius + gridSmoothWidth, radius, length(coord - (pos)))
+        #define drawSmoothLine(pos, halfWidth, t) smoothstep(halfWidth, 0.0, abs(pos - (t)))
+        #define drawCrispLine(pos, halfWidth, t) smoothstep(halfWidth + gridSmoothWidth, halfWidth, abs(pos - (t)))
 
-    float random(float t) {
-      return (cos(t) + cos(t * 1.3 + 1.3) + cos(t * 1.4 + 1.4)) / 3.0;
-    }
+        float random(float t) {
+          return (cos(t) + cos(t * 1.3 + 1.3) + cos(t * 1.4 + 1.4)) / 3.0;
+        }
 
-    float getPlasmaY(float x, float hFade, float offset) {
-      return random(x * lineFrequency + iTime * lineSpeed) * hFade * lineAmplitude + offset;
-    }
+        float getPlasmaY(float x, float horizontalFade, float offset) {
+          return random(x * lineFrequency + iTime * lineSpeed) * horizontalFade * lineAmplitude + offset;
+        }
 
-    void main() {
-      vec2 uv = gl_FragCoord.xy / iResolution.xy;
-      vec2 space = (gl_FragCoord.xy - iResolution.xy * 0.5) / iResolution.x * 2.0 * scale;
+        void main() {
+          vec2 uv = gl_FragCoord.xy / iResolution.xy;
+          vec2 space = (gl_FragCoord.xy - iResolution.xy / 2.0) / iResolution.x * 2.0 * scale;
 
-      float hFade = 1.0 - (cos(uv.x * 6.28) * 0.5 + 0.5);
-      float vFade = 1.0 - (cos(uv.y * 6.28) * 0.5 + 0.5);
+          float horizontalFade = 1.0 - (cos(uv.x * 6.28) * 0.5 + 0.5);
+          float verticalFade = 1.0 - (cos(uv.y * 6.28) * 0.5 + 0.5);
 
-      space.y += random(space.x * warpFrequency + iTime * warpSpeed) * warpAmplitude * (0.5 + hFade);
-      space.x += random(space.y * warpFrequency + iTime * warpSpeed + 2.0) * warpAmplitude * hFade;
+          space.y += random(space.x * warpFrequency + iTime * warpSpeed) * warpAmplitude * (0.5 + horizontalFade);
+          space.x += random(space.y * warpFrequency + iTime * warpSpeed + 2.0) * warpAmplitude * horizontalFade;
 
-      vec4 lines = vec4(0.0);
-      vec4 bg1 = vec4(0.1, 0.1, 0.3, 1.0);
-      vec4 bg2 = vec4(0.3, 0.1, 0.5, 1.0);
+          vec4 lines = vec4(0.0);
+          vec4 bgColor1 = vec4(0.1, 0.1, 0.3, 1.0);
+          vec4 bgColor2 = vec4(0.3, 0.1, 0.5, 1.0);
 
-      for(int l = 0; l < linesPerGroup; l++) {
-        float n = float(l) / float(linesPerGroup);
-        float offT = iTime * offsetSpeed;
-        float offPos = float(l) + space.x * offsetFrequency;
-        float rand = random(offPos + offT) * 0.5 + 0.5;
-        float halfW = mix(minLineWidth, maxLineWidth, rand * hFade) / 2.0;
-        float off = random(offPos + offT * (1.0 + n)) * mix(minOffsetSpread, maxOffsetSpread, hFade);
-        float lineY = getPlasmaY(space.x, hFade, off);
-        float line = drawSmoothLine(lineY, halfW, space.y) * 0.5 + drawCrispLine(lineY, halfW * 0.15, space.y);
+          for(int l = 0; l < linesPerGroup; l++) {
+            float normalizedLineIndex = float(l) / float(linesPerGroup);
+            float offsetTime = iTime * offsetSpeed;
+            float offsetPosition = float(l) + space.x * offsetFrequency;
+            float rand = random(offsetPosition + offsetTime) * 0.5 + 0.5;
+            float halfWidth = mix(minLineWidth, maxLineWidth, rand * horizontalFade) / 2.0;
+            float offset = random(offsetPosition + offsetTime * (1.0 + normalizedLineIndex)) * mix(minOffsetSpread, maxOffsetSpread, horizontalFade);
+            float linePosition = getPlasmaY(space.x, horizontalFade, offset);
+            float line = drawSmoothLine(linePosition, halfWidth, space.y) / 2.0 + drawCrispLine(linePosition, halfWidth * 0.15, space.y);
 
-        float circX = mod(float(l) + iTime * lineSpeed, 25.0) - 12.0;
-        vec2 circPos = vec2(circX, getPlasmaY(circX, hFade, off));
-        float circ = drawCircle(circPos, 0.01, space) * 4.0;
+            float circleX = mod(float(l) + iTime * lineSpeed, 25.0) - 12.0;
+            vec2 circlePosition = vec2(circleX, getPlasmaY(circleX, horizontalFade, offset));
+            float circle = drawCircle(circlePosition, 0.01, space) * 4.0;
 
-        lines += (line + circ) * lineColor * rand;
+            line = line + circle;
+            lines += line * lineColor * rand;
+          }
+
+          vec4 fragColor = mix(bgColor1, bgColor2, uv.x);
+          fragColor *= verticalFade;
+          fragColor.a = 1.0;
+          fragColor += lines;
+
+          gl_FragColor = fragColor;
+        }
+      `;
+
+      function loadShader(gl, type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+          console.error(gl.getShaderInfoLog(shader));
+          gl.deleteShader(shader);
+          return null;
+        }
+        return shader;
       }
 
-      vec4 col = mix(bg1, bg2, uv.x);
-      col *= vFade;
-      col.a = 1.0;
-      col += lines;
-      gl_FragColor = col;
+      const vertexShader = loadShader(gl, gl.VERTEX_SHADER, vsSource);
+      const fragmentShader = loadShader(gl, gl.FRAGMENT_SHADER, fsSource);
+
+      const program = gl.createProgram();
+      gl.attachShader(program, vertexShader);
+      gl.attachShader(program, fragmentShader);
+      gl.linkProgram(program);
+
+      const positionBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+
+      const aVertexPosition = gl.getAttribLocation(program, 'aVertexPosition');
+      const iResolution = gl.getUniformLocation(program, 'iResolution');
+      const iTime = gl.getUniformLocation(program, 'iTime');
+
+      function resize() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+      }
+      window.addEventListener('resize', resize);
+      resize();
+
+      const startTime = Date.now();
+      function render() {
+        const time = (Date.now() - startTime) / 1000;
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.useProgram(program);
+        gl.uniform2f(iResolution, canvas.width, canvas.height);
+        gl.uniform1f(iTime, time);
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.vertexAttribPointer(aVertexPosition, 2, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(aVertexPosition);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        requestAnimationFrame(render);
+      }
+      render();
     }
-  `;
+    </script>
 
-  function loadShader(gl, type, src) {
-    const s = gl.createShader(type);
-    gl.shaderSource(s, src);
-    gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { gl.deleteShader(s); return null; }
-    return s;
-  }
+    <div style="position: relative; z-index: 1; color: white; text-align: center; padding-top: 100px;">
+      <h1>PromptAI Cinema</h1>
+      <p>Il tuo sito è online! 🎉</p>
+    </div>
 
-  const vs = loadShader(gl, gl.VERTEX_SHADER, vsSource);
-  const fs = loadShader(gl, gl.FRAGMENT_SHADER, fsSource);
-  const prog = gl.createProgram();
-  gl.attachShader(prog, vs);
-  gl.attachShader(prog, fs);
-  gl.linkProgram(prog);
-
-  const buf = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
-
-  const posLoc = gl.getAttribLocation(prog, 'aVertexPosition');
-  const resLoc = gl.getUniformLocation(prog, 'iResolution');
-  const timeLoc = gl.getUniformLocation(prog, 'iTime');
-
-  function resize() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
-    gl.viewport(0, 0, canvas.width, canvas.height);
-  }
-  resize();
-  window.addEventListener('resize', resize);
-
-  const start = Date.now();
-  function render() {
-    const t = (Date.now() - start) / 1000;
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.clearColor(0,0,0,1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.useProgram(prog);
-    gl.uniform2f(resLoc, canvas.width, canvas.height);
-    gl.uniform1f(timeLoc, t);
-    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
-    gl.enableVertexAttribArray(posLoc);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    requestAnimationFrame(render);
-  }
-  render();
-}
-</script>
- <meta charset="UTF-8"> <meta name="viewport" content="width=device-width, initial-scale=1.0"> <meta name="description" content="PromptAI Cinema trasforma le tue idee in prompt cinematografici pronti per i generatori video IA. Gratis, nel tuo browser."> <meta name="theme-color" content="#0a101f"> <title>PromptAI Cinema — Generatore di Prompt IA Cinematografici</title><!-- Google tag (gtag.js) -->
-<script async src="https://www.googletagmanager.com/gtag/js?id=G-NW2MHXP0VT"></script>
-<script>
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){dataLayer.push(arguments);}
-  gtag('js', new Date());
-  gtag('config', 'G-NW2MHXP0VT');
-</script>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%2300d4ff'/%3E%3Cstop offset='1' stop-color='%23ff6bcb'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='100' height='100' rx='22' fill='%230f172a'/%3E%3Cpath d='M30 28h28a16 16 0 0 1 0 32H42v14H30z' fill='url(%23g)'/%3E%3C/svg%3E"> <style> :root { --ciano: #00d4ff; --rosa: #ff6bcb; --blu-notte: #0a101f; --blu-scuro: #0f172a; --testo-chiaro: #e2e8f0; --testo-secondario: #94a3b8; }
-* { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-html { scroll-behavior: smooth; scroll-padding-top: 90px; }
-body { background: var(--blu-notte); color: var(--testo-chiaro); min-height: 100vh; line-height: 1.6; overflow-x: hidden; }
-/* Sfondo effetto Matrix linee verticali */ .matrix-bg { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-image: linear-gradient(180deg, rgba(0, 212, 255, 0.04) 0%, transparent 90%), repeating-linear-gradient(90deg, rgba(0, 212, 255, 0.06) 0px, rgba(0, 212, 255, 0.06) 1px, transparent 1px, transparent 60px ); pointer-events: none; z-index: 0; }
-.glow { position: fixed; top: -300px; left: 50%; transform: translateX(-50%); width: 900px; height: 700px; background: radial-gradient(circle, rgba(0, 212, 255, 0.12) 0%, rgba(255, 107, 203, 0.06) 45%, transparent 70%); filter: blur(20px); pointer-events: none; z-index: 0; }
-.container { position: relative; z-index: 1; max-width: 1200px; margin: 0 auto; padding: 0 20px; }
-.skip-link { position: absolute; left: -9999px; top: 0; background: var(--ciano); color: #04121a; padding: 10px 18px; border-radius: 0 0 8px 0; font-weight: 700; z-index: 100; }
-.skip-link:focus { left: 0; }
-/* Header */ header { position: sticky; top: 0; z-index: 50; background: rgba(10, 16, 31, 0.78); backdrop-filter: blur(14px); border-bottom: 1px solid rgba(255, 255, 255, 0.05); }
-.header-inner { display: flex; justify-content: space-between; align-items: center; padding: 16px 0; gap: 16px; }
-.logo { font-size: 22px; font-weight: 800; background: linear-gradient(90deg, var(--ciano), var(--rosa)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; text-decoration: none; white-space: nowrap; display: inline-flex; align-items: center; gap: 10px; }
-.logo-mark { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; background: linear-gradient(135deg, var(--ciano), var(--rosa)); color: #04121a; font-size: 15px; font-weight: 900; -webkit-text-fill-color: #04121a; flex: none; }
-.nav-links { display: flex; align-items: center; gap: 24px; }
-.nav-links a { color: var(--testo-secondario); text-decoration: none; font-size: 15px; transition: color 0.2s; }
-.nav-links a:hover, .nav-links a:focus-visible { color: var(--ciano); }
-.btn-accedi { background: linear-gradient(90deg, var(--ciano), var(--rosa)); color: #04121a; border: none; padding: 10px 24px; border-radius: 8px; font-weight: 700; font-size: 15px; cursor: pointer; transition: transform 0.2s, box-shadow 0.2s; white-space: nowrap; }
-.btn-accedi:hover { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0, 212, 255, 0.3); }
-.instagram-icon { display: inline-flex; align-items: center; justify-content: center; font-size: 20px; line-height: 1; }
-.instagram-icon svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 1.8; }
-.mobile-toggle { display: none; background: transparent; border: 1px solid rgba(0, 212, 255, 0.25); color: var(--testo-chiaro); width: 42px; height: 42px; border-radius: 8px; cursor: pointer; font-size: 20px; line-height: 1; }
-/* Hero Section */ .hero { text-align: center; padding: 56px 0 70px; }
-.badge { display: inline-flex; align-items: center; gap: 8px; background: rgba(0, 212, 255, 0.08); border: 1px solid rgba(0, 212, 255, 0.2); padding: 8px 20px; border-radius: 30px; font-size: 14px; color: var(--ciano); margin-bottom: 32px; }
-.badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ciano); box-shadow: 0 0 10px var(--ciano); animation: pulse 2.4s infinite; }
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
-h1 { font-size: clamp(36px, 7vw, 64px); line-height: 1.15; margin-bottom: 24px; letter-spacing: -0.02em; }
-.gradient-text { background: linear-gradient(90deg, var(--ciano), var(--rosa)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
-.hero p { font-size: 18px; color: var(--testo-secondario); max-width: 700px; margin: 0 auto 48px; line-height: 1.7; }
-/* Generatore Box */ .generator-box { background: var(--blu-scuro); border: 1px solid rgba(0, 212, 255, 0.15); border-radius: 16px; padding: 32px; max-width: 760px; margin: 0 auto; box-shadow: 0 0 40px rgba(0, 212, 255, 0.05); text-align: left; }
-.field-label { display: block; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--testo-secondario); margin-bottom: 8px; }
-textarea { width: 100%; min-height: 120px; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 8px; padding: 16px; color: var(--testo-chiaro); font-size: 15px; resize: vertical; margin-bottom: 8px; line-height: 1.6; transition: border-color 0.2s, box-shadow 0.2s; }
-textarea::placeholder { color: #64748b; }
-textarea:focus { outline: none; border-color: var(--ciano); box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.12); }
-textarea.shake { animation: shake 0.4s; border-color: #f87171; }
-@keyframes shake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-6px); } 75% { transform: translateX(6px); } }
-.char-count { text-align: right; font-size: 13px; color: var(--testo-secondario); margin-bottom: 20px; }
-.char-count.limit { color: #f87171; }
-.generator-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
-.generator-grid .field { min-width: 0; }
-select { width: 100%; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 8px; padding: 12px 16px; color: var(--testo-chiaro); font-size: 15px; cursor: pointer; transition: border-color 0.2s; }
-select:focus { outline: none; border-color: var(--ciano); }
-select option { background: var(--blu-scuro); color: var(--testo-chiaro); }
-.btn-trasforma { width: 100%; background: linear-gradient(90deg, var(--ciano), var(--rosa)); color: #04121a; border: none; padding: 16px; border-radius: 8px; font-size: 17px; font-weight: 700; cursor: pointer; transition: transform 0.2s, box-shadow 0.2s, opacity 0.2s; display: inline-flex; align-items: center; justify-content: center; gap: 10px; }
-.btn-trasforma:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 6px 25px rgba(0, 212, 255, 0.3); }
-.btn-trasforma:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
-.spinner { width: 17px; height: 17px; border: 2px solid rgba(4, 18, 26, 0.3); border-top-color: #04121a; border-radius: 50%; animation: spin 0.7s linear infinite; display: none; }
-.btn-trasforma.loading .spinner { display: inline-block; }
-@keyframes spin { to { transform: rotate(360deg); } }
-.small-note { text-align: center; font-size: 13px; color: var(--testo-secondario); margin-top: 16px; }
-.small-note strong { color: var(--ciano); font-weight: 600; }
-/* Lingua prompt */ .prompt-lang { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; padding-top: 18px; border-top: 1px solid rgba(255, 255, 255, 0.06); flex-wrap: wrap; }
-.prompt-lang span { font-size: 13px; color: var(--testo-secondario); }
-.segmented { display: inline-flex; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 8px; padding: 3px; gap: 3px; }
-.segmented button { background: transparent; border: none; color: var(--testo-secondario); font-size: 13px; font-weight: 700; padding: 6px 14px; border-radius: 6px; cursor: pointer; transition: all 0.2s; }
-.segmented button[aria-pressed="true"] { background: linear-gradient(90deg, var(--ciano), var(--rosa)); color: #04121a; }
-/* Risultato */ .result-section { max-width: 760px; margin: 30px auto; display: none; }
-.result-section.show { display: block; animation: rise 0.4s ease both; }
-@keyframes rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
-.result-box { background: var(--blu-scuro); border: 1px solid rgba(255, 107, 203, 0.25); border-radius: 16px; padding: 24px; text-align: left; box-shadow: 0 0 40px rgba(255, 107, 203, 0.05); }
-.result-box h3 { font-size: 16px; color: var(--rosa); margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
-.result-content { background: rgba(0, 0, 0, 0.3); padding: 16px; border-radius: 8px; font-family: 'Cascadia Code', Consolas, 'Courier New', monospace; font-size: 13.5px; line-height: 1.8; color: #e5e7eb; white-space: pre-wrap; overflow-wrap: anywhere; margin-bottom: 16px; max-height: 440px; overflow-y: auto; }
-.result-content::-webkit-scrollbar { width: 8px; }
-.result-content::-webkit-scrollbar-thumb { background: rgba(0, 212, 255, 0.3); border-radius: 4px; }
-.result-buttons { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-.btn-secondary { background: transparent; color: var(--ciano); border: 1px solid var(--ciano); padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; transition: all 0.2s; }
-.btn-secondary:hover { background: rgba(0, 212, 255, 0.1); }
-.btn-secondary.ghost { color: var(--testo-secondario); border-color: rgba(148, 163, 184, 0.35); }
-.btn-secondary.ghost:hover { color: var(--testo-chiaro); background: rgba(148, 163, 184, 0.08); }
-.copied-msg { color: #10b981; font-size: 13px; margin-left: 10px; display: none; }
-.copied-msg.show { display: inline; }
-/* Impostazioni API */ .api-settings { background: var(--blu-scuro); border: 1px solid rgba(0, 212, 255, 0.15); border-radius: 12px; padding: 0; max-width: 760px; margin: 24px auto 0; text-align: left; overflow: hidden; }
-.api-settings summary { cursor: pointer; padding: 16px 24px; font-size: 14px; font-weight: 600; color: var(--testo-secondario); list-style: none; display: flex; align-items: center; gap: 10px; transition: color 0.2s; }
-.api-settings summary::-webkit-details-marker { display: none; }
-.api-settings summary:hover { color: var(--ciano); }
-.api-settings summary::after { content: "+"; margin-left: auto; font-size: 18px; color: var(--ciano); line-height: 1; }
-.api-settings[open] summary::after { content: "−"; }
-.api-body { padding: 0 24px 24px; }
-.api-body h3 { font-size: 16px; margin-bottom: 6px; color: var(--ciano); }
-.api-body input { width: 100%; padding: 10px 14px; background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 6px; color: var(--testo-chiaro); margin-bottom: 12px; font-size: 14px; }
-.api-body input:focus { outline: none; border-color: var(--ciano); }
-.api-note { font-size: 12px; color: var(--testo-secondario); margin-bottom: 14px; line-height: 1.6; }
-.api-status { font-size: 12px; margin-top: 10px; color: #10b981; }
-/* Sezioni Generali */ section { padding: 70px 0; }
-section h2 { font-size: clamp(26px, 4vw, 32px); text-align: center; margin-bottom: 50px; letter-spacing: -0.01em; }
-section h2 span { color: var(--ciano); }
-.section-desc { text-align: center; color: var(--testo-secondario); max-width: 600px; margin: -30px auto 40px; }
-/* Stats */ .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 24px; text-align: center; }
-.stat-card { background: var(--blu-scuro); border: 1px solid rgba(0, 212, 255, 0.1); border-radius: 12px; padding: 30px 20px; transition: border-color 0.2s, transform 0.2s; }
-.stat-card:hover { border-color: rgba(0, 212, 255, 0.35); transform: translateY(-3px); }
-.stat-number { font-size: 40px; font-weight: 800; color: var(--ciano); margin-bottom: 8px; line-height: 1.1; }
-.stat-label { color: var(--testo-secondario); font-size: 14px; }
-/* Galleria Video */ .gallery-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
-.gallery-item { position: relative; background: var(--blu-scuro); border-radius: 12px; overflow: hidden; aspect-ratio: 16/9; border: 1px solid rgba(0, 212, 255, 0.1); cursor: pointer; transition: transform 0.25s, border-color 0.25s, box-shadow 0.25s; }
-.gallery-item:hover, .gallery-item:focus-visible { transform: translateY(-4px); border-color: rgba(0, 212, 255, 0.45); box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45); outline: none; }
-.thumb { position: absolute; inset: 0; transition: transform 0.5s ease, filter 0.3s; }
-.gallery-item:hover .thumb { transform: scale(1.06); }
-.thumb::after { content: ""; position: absolute; inset: 0; background: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.12) 0 1px, transparent 1px 3px), linear-gradient(180deg, transparent 45%, rgba(4, 10, 20, 0.85) 100%); }
-.thumb-1 { background: radial-gradient(circle at 30% 35%, #00d4ff 0%, #0b3d5c 35%, #1a0b2e 70%, #05060d 100%); } .thumb-2 { background: radial-gradient(circle at 70% 30%, #ffb347 0%, #b5541f 30%, #3d1a0e 65%, #0d0603 100%); } .thumb-3 { background: radial-gradient(circle at 50% 25%, #f8fafc 0%, #94a3b8 25%, #1e293b 60%, #020617 100%); filter: grayscale(1) contrast(1.15); } .thumb-4 { background: radial-gradient(circle at 25% 70%, #34d399 0%, #065f46 35%, #052e2b 70%, #020c0b 100%); } .thumb-5 { background: radial-gradient(circle at 65% 40%, #ff6bcb 0%, #7c3aed 35%, #1e1b4b 70%, #05030f 100%); } .thumb-6 { background: radial-gradient(circle at 45% 30%, #fde68a 0%, #f97316 25%, #7f1d1d 60%, #120404 100%); }
-.play { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 52px; height: 52px; border-radius: 50%; display: grid; place-items: center; background: rgba(10, 16, 31, 0.55); border: 1px solid rgba(255, 255, 255, 0.45); backdrop-filter: blur(4px); z-index: 2; transition: background 0.2s, transform 0.2s; }
-.play svg { width: 18px; height: 18px; fill: #fff; margin-left: 3px; }
-.gallery-item:hover .play { background: rgba(0, 212, 255, 0.85); transform: translate(-50%, -50%) scale(1.08); }
-.gallery-caption { position: absolute; left: 16px; right: 16px; bottom: 14px; z-index: 2; font-size: 13px; font-weight: 600; color: #fff; text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8); }
-.gallery-caption small { display: block; font-weight: 400; font-size: 11.5px; color: rgba(255, 255, 255, 0.7); }
-/* Card Sezione */ .feature-card { background: var(--blu-scuro); border: 1px solid rgba(0, 212, 255, 0.1); border-radius: 12px; padding: 30px; text-align: left; transition: border-color 0.2s, transform 0.2s; }
-.feature-card:hover { border-color: rgba(0, 212, 255, 0.3); transform: translateY(-3px); }
-.feature-icon { width: 44px; height: 44px; border-radius: 10px; display: grid; place-items: center; background: rgba(0, 212, 255, 0.08); border: 1px solid rgba(0, 212, 255, 0.18); margin-bottom: 18px; }
-.feature-icon svg { width: 22px; height: 22px; stroke: var(--ciano); fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
-.feature-card h3 { font-size: 19px; margin-bottom: 10px; color: var(--testo-chiaro); }
-.feature-card p { color: var(--testo-secondario); font-size: 15px; }
-/* Griglia Funzioni */ .functions-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
-/* Libreria Cronologia */ .history-list { max-width: 760px; margin: 0 auto; }
-.history-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
-.history-toolbar p { color: var(--testo-secondario); font-size: 14px; }
-.history-item { background: var(--blu-scuro); border-radius: 8px; padding: 16px 18px; margin-bottom: 12px; border-left: 3px solid var(--ciano); cursor: pointer; transition: background 0.2s, border-color 0.2s, transform 0.2s; text-align: left; }
-.history-item:hover { background: #131d33; border-left-color: var(--rosa); transform: translateX(2px); }
-.history-prompt { font-size: 13px; color: var(--testo-secondario); margin-bottom: 8px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-.history-tag { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--rosa); border: 1px solid rgba(255, 107, 203, 0.3); border-radius: 20px; padding: 1px 8px; flex: none; }
-.history-result { font-size: 14px; color: var(--testo-chiaro); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.history-date { font-size: 12px; color: #64748b; margin-top: 8px; }
-.empty-state { text-align: center; color: var(--testo-secondario); font-size: 14px; padding: 40px 20px; border: 1px dashed rgba(148, 163, 184, 0.25); border-radius: 12px; max-width: 760px; margin: 0 auto; }
-/* Piani */ .pricing-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 30px; max-width: 800px; margin: 0 auto; }
-.pricing-card { background: var(--blu-scuro); border: 1px solid rgba(0, 212, 255, 0.15); border-radius: 16px; padding: 32px; display: flex; flex-direction: column; }
-.pricing-card.pro { border-color: var(--rosa); position: relative; box-shadow: 0 0 50px rgba(255, 107, 203, 0.08); }
-.pricing-card.pro::before { content: "Più popolare"; position: absolute; top: -12px; left: 50%; transform: translateX(-50%); background: linear-gradient(90deg, var(--ciano), var(--rosa)); color: #04121a; padding: 4px 16px; border-radius: 20px; font-size: 12px; font-weight: 700; white-space: nowrap; }
-.pricing-card h3 { font-size: 24px; margin-bottom: 8px; }
-.price { font-size: 36px; font-weight: 800; color: var(--ciano); margin-bottom: 6px; line-height: 1.1; }
-.price small { font-size: 15px; font-weight: 500; color: var(--testo-secondario); }
-.pricing-sub { color: var(--testo-secondario); font-size: 14px; margin-bottom: 20px; }
-.pricing-card ul { list-style: none; margin-bottom: 24px; }
-.pricing-card li { padding: 8px 0 8px 26px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); color: var(--testo-secondario); font-size: 15px; position: relative; }
-.pricing-card li::before { content: "✓"; position: absolute; left: 0; color: var(--ciano); font-weight: 700; }
-.pricing-card li:last-child { border-bottom: none; }
-.pricing-card .btn-trasforma { margin-top: auto; font-size: 15px; padding: 13px; }
-/* CTA */ .cta-section { text-align: center; background: linear-gradient(90deg, rgba(0, 212, 255, 0.05), rgba(255, 107, 203, 0.05)); border: 1px solid rgba(0, 212, 255, 0.1); border-radius: 20px; padding: 60px 30px; margin: 20px 0 60px; }
-.cta-section h2 { margin-bottom: 20px; }
-.cta-section p { color: var(--testo-secondario); max-width: 500px; margin: 0 auto 30px; }
-/* Footer */ footer { border-top: 1px solid rgba(255, 255, 255, 0.05); padding: 60px 0 30px; }
-.footer-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 40px; margin-bottom: 40px; }
-.footer-col h4 { font-size: 15px; margin-bottom: 16px; color: var(--testo-chiaro); }
-.footer-col a { display: block; color: var(--testo-secondario); text-decoration: none; font-size: 14px; margin-bottom: 10px; transition: color 0.2s; }
-.footer-col a:hover { color: var(--ciano); }
-.footer-brand p { color: var(--testo-secondario); font-size: 14px; max-width: 260px; margin-top: 10px; }
-.copyright { text-align: center; padding-top: 30px; border-top: 1px solid rgba(255, 255, 255, 0.05); color: var(--testo-secondario); font-size: 13px; }
-/* Toast */ .toast-wrap { position: fixed; bottom: 24px; right: 24px; z-index: 200; display: flex; flex-direction: column; gap: 10px; max-width: calc(100vw - 48px); }
-.toast { background: #111c33; border: 1px solid rgba(0, 212, 255, 0.35); color: var(--testo-chiaro); padding: 12px 18px; border-radius: 10px; font-size: 14px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); animation: rise 0.25s ease both; display: flex; gap: 10px; align-items: center; }
-.toast.error { border-color: rgba(248, 113, 113, 0.5); }
-/* Reveal on scroll */ .reveal { opacity: 0; transform: translateY(18px); transition: opacity 0.6s ease, transform 0.6s ease; }
-.reveal.visible { opacity: 1; transform: none; }
-/* Responsive */ @media (max-width: 860px) { .nav-links { position: absolute; top: 100%; left: 0; right: 0; flex-direction: column; align-items: stretch; gap: 4px; background: rgba(10, 16, 31, 0.98); border-bottom: 1px solid rgba(0, 212, 255, 0.15); padding: 12px 20px 20px; display: none; }
-.nav-links.open { display: flex; }
-.nav-links a { padding: 10px 4px; font-size: 16px; }
-.nav-links .btn-accedi { margin-top: 8px; }
-.mobile-toggle { display: inline-block; }
-.header-inner { position: relative; }
-header { position: sticky; } }
-@media (max-width: 640px) { .hero { padding: 40px 0 50px; }
-.generator-box { padding: 22px 18px; }
-.generator-grid { grid-template-columns: 1fr; }
-section { padding: 50px 0; }
-.section-desc { margin-top: -24px; }
-.cta-section { padding: 44px 20px; }
-.result-box { padding: 18px; }
-.toast-wrap { left: 16px; right: 16px; bottom: 16px; } }
-@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; }
-*, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
-.reveal { opacity: 1; transform: none; } } </style></head><body> <a class="skip-link" href="#generatore">Salta al generatore</a> <div class="matrix-bg" aria-hidden="true"></div> <div class="glow" aria-hidden="true"></div>
-<header> <div class="container header-inner"> <a class="logo" href="#top"> <span class="logo-mark" aria-hidden="true">P</span> PromptAI Cinema </a>
-<button class="mobile-toggle" id="mobileToggle" aria-label="Apri il menu" aria-expanded="false" aria-controls="navLinks">☰</button>
-<nav class="nav-links" id="navLinks" aria-label="Navigazione principale"> <a href="#generatore">Generatore</a> <a href="#galleria">Galleria</a> <a href="#funzioni">Funzioni</a> <a href="#prezzi">Prezzi</a> <a class="instagram-icon" href="https://www.instagram.com/" target="_blank" rel="noopener" aria-label="Seguici su Instagram"> <svg viewBox="0 0 24 24" aria-hidden="true"> <rect x="3" y="3" width="18" height="18" rx="5"></rect> <circle cx="12" cy="12" r="4"></circle> <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"></circle> </svg> </a> <button class="btn-accedi" id="loginBtn" type="button">Accedi</button> </nav> </div> </header>
-<main id="top"> <div class="container"> <!-- HERO --> <section class="hero" aria-labelledby="heroTitle"> <div class="badge"> <span class="dot" aria-hidden="true"></span> Generatore di prompt cinematografici con IA </div> <h1 id="heroTitle"> Dalla tua idea al<br> <span class="gradient-text">prompt cinematografico</span> </h1> <p> Descrivi una scena in italiano. PromptAI Cinema la trasforma in un prompt professionale — inquadratura, lenti, luce, color grading — pronto per Sora, Runway, Kling, Veo e Midjourney. </p>
-<div class="generator-box" id="generatore"> <form id="promptForm" novalidate> <label class="field-label" for="idea">La tua idea</label> <textarea id="idea" name="idea" maxlength="600" placeholder="Es. Un faro isolato durante una tempesta, una donna in impermeabile giallo guarda il mare in tempesta..." aria-describedby="charCount" ></textarea> <div class="char-count" id="charCount">0 / 600</div>
-<div class="generator-grid"> <div class="field"> <label class="field-label" for="style">Stile visivo</label> <select id="style" name="style"> <option value="cinematico">Cinematografico</option> <option value="noir">Noir in bianco e nero</option> <option value="scifi">Sci-fi / Cyberpunk</option> <option value="horror">Horror</option> <option value="documentario">Documentario</option> <option value="anime">Anime</option> <option value="vintage">Vintage Super 8</option> <option value="fantasy">Fantasy epico</option> </select> </div> <div class="field"> <label class="field-label" for="ratio">Formato</label> <select id="ratio" name="ratio"> <option value="16:9">16:9 — Orizzontale</option> <option value="9:16">9:16 — Verticale / Reels</option> <option value="2.39:1">2.39:1 — CinemaScope</option> <option value="4:3">4:3 — Vintage</option> <option value="1:1">1:1 — Quadrato</option> </select> </div> </div>
-<button class="btn-trasforma" id="generateBtn" type="submit"> <span class="spinner" aria-hidden="true"></span> <span id="generateLabel">Trasforma in prompt</span> </button>
-<p class="small-note"> <strong>Gratis e privato.</strong> L'elaborazione avviene nel tuo browser: nessuna idea inviata altrove. </p>
-<div class="prompt-lang"> <span>Lingua del prompt</span> <div class="segmented" role="group" aria-label="Lingua del prompt"> <button type="button" data-lang="en" aria-pressed="true">EN</button> <button type="button" data-lang="it" aria-pressed="false">IT</button> </div> </div> </form> </div>
-<!-- RISULTATO --> <div class="result-section" id="resultSection"> <div class="result-box"> <h3> <span aria-hidden="true">✦</span> Il tuo prompt cinematografico </h3> <div class="result-content" id="resultContent" tabindex="0"></div> <div class="result-buttons"> <button class="btn-secondary" id="copyBtn" type="button">Copia prompt</button> <button class="btn-secondary" id="regenBtn" type="button">Rigenera</button> <button class="btn-secondary ghost" id="downloadBtn" type="button">Scarica .txt</button> <span class="copied-msg" id="copiedMsg" role="status">Copiato ✓</span> </div> </div> </div>
-<!-- API OPZIONALE --> <details class="api-settings" id="apiSettings"> <summary>Impostazioni avanzate — usa la tua API (opzionale)</summary> <div class="api-body"> <h3>API compatibile OpenAI</h3> <p class="api-note"> Se configuri un endpoint e una chiave, il prompt verrà generato da un modello remoto invece che dal motore locale. I dati restano salvati solo in questo browser (localStorage): non usare chiavi condivise su computer pubblici. </p> <label class="field-label" for="apiEndpoint">Endpoint</label> <input id="apiEndpoint" type="url" placeholder="https://api.openai.com/v1/chat/completions" autocomplete="off"> <label class="field-label" for="apiModel">Modello</label> <input id="apiModel" type="text" placeholder="gpt-4o-mini" autocomplete="off"> <label class="field-label" for="apiKey">Chiave API</label> <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off"> <div class="result-buttons"> <button class="btn-secondary" id="saveApiBtn" type="button">Salva impostazioni</button> <button class="btn-secondary ghost" id="clearApiBtn" type="button">Rimuovi</button> </div> <div class="api-status" id="apiStatus" role="status"></div> </div> </details> </section>
-<!-- STATS --> <section aria-labelledby="statsTitle" class="reveal"> <h2 id="statsTitle" class="sr-only" style="position:absolute;left:-9999px;">Numeri</h2> <div class="stats-grid"> <div class="stat-card"> <div class="stat-number">8</div> <div class="stat-label">Stili visivi pronti</div> </div> <div class="stat-card"> <div class="stat-number">0 €</div> <div class="stat-label">Per iniziare</div> </div> <div class="stat-card"> <div class="stat-number">100%</div> <div class="stat-label">Elaborazione nel browser</div> </div> <div class="stat-card"> <div class="stat-number">∞</div> <div class="stat-label">Prompt al giorno</div> </div> </div> </section>
-<!-- LIBRERIA --> <section id="libreria" aria-labelledby="libreriaTitle"> <h2 id="libreriaTitle">La tua <span>libreria</span></h2> <div class="history-toolbar" id="historyToolbar" hidden> <p>I tuoi ultimi prompt, salvati solo su questo dispositivo.</p> <button class="btn-secondary ghost" id="clearHistoryBtn" type="button">Svuota libreria</button> </div> <div class="history-list" id="historyList"></div> </section>
-<!-- GALLERIA --> <section id="galleria" aria-labelledby="galleriaTitle"> <h2 id="galleriaTitle">Ispirazioni dalla <span>galleria</span></h2> <p class="section-desc">Sei scenari di partenza. Clicca su uno per caricare l'idea nel generatore.</p> <div class="gallery-grid"> <button class="gallery-item" type="button" data-idea="Una città al neon sotto la pioggia, un detective solitario attraversa un mercato affollato di ologrammi." aria-label="Usa l'idea: città al neon"> <span class="thumb thumb-1" aria-hidden="true"></span> <span class="play" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></span> <span class="gallery-caption">Neon rain<small>Sci-fi / Cyberpunk</small></span> </button> <button class="gallery-item" type="button" data-idea="Un viaggiatore solitario attraversa il deserto al tramonto, la polvere illumina l'aria, una tempesta si avvicina." aria-label="Usa l'idea: deserto al tramonto"> <span class="thumb thumb-2" aria-hidden="true"></span> <span class="play" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></span> <span class="gallery-caption">Desert dust<small>Cinematografico</small></span> </button> <button class="gallery-item" type="button" data-idea="Un uomo in un ufficio vuoto di notte, una lampada da tavolo, ombre di tapparelle sul muro, fumo di sigaretta nell'aria." aria-label="Usa l'idea: ufficio noir"> <span class="thumb thumb-3" aria-hidden="true"></span> <span class="play" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></span> <span class="gallery-caption">Last light<small>Noir</small></span> </button> <button class="gallery-item" type="button" data-idea="Una bambina cammina in una foresta nebbiosa all'alba, tracce di passi nel fango, silenzio assoluto." aria-label="Usa l'idea: foresta nebbiosa"> <span class="thumb thumb-4" aria-hidden="true"></span> <span class="play" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></span> <span class="gallery-caption">Into the mist<small>Horror</small></span> </button> <button class="gallery-item" type="button" data-idea="Una stazione spaziale abbandonata in orbita, detriti che fluttuano, la Terra che si riflette nel vetro crepato." aria-label="Usa l'idea: stazione spaziale"> <span class="thumb thumb-5" aria-hidden="true"></span> <span class="play" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></span> <span class="gallery-caption">Orbital drift<small>Sci-fi</small></span> </button> <button class="gallery-item" type="button" data-idea="Due anziani ballano in una cucina di campagna al tramonto, luce calda, dischi in vinile, polvere nell'aria." aria-label="Usa l'idea: ballo in cucina"> <span class="thumb thumb-6" aria-hidden="true"></span> <span class="play" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></span> <span class="gallery-caption">Golden hour<small>Vintage</small></span> </button> </div> </section>
-<!-- FUNZIONI --> <section id="funzioni" aria-labelledby="funzioniTitle"> <h2 id="funzioniTitle">Tutto quello che serve per <span>girare</span></h2> <div class="functions-grid"> <article class="feature-card"> <div class="feature-icon" aria-hidden="true"> <svg viewBox="0 0 24 24"><path d="M3 7h11a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H3z"/><path d="m16 10 5-3v10l-5-3z"/></svg> </div> <h3>Pronto per ogni modello</h3> <p>Struttura e linguaggio ottimizzati per Sora, Runway, Kling, Veo, Pika e per la generazione di immagini con Midjourney o Flux.</p> </article> <article class="feature-card"> <div class="feature-icon" aria-hidden="true"> <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18M3 12h18"/></svg> </div> <h3>Direzione della fotografia</h3> <p>Lenti, inquadrature, movimenti di macchina e luci motivati: il prompt include le scelte tecniche che fanno la differenza.</p> </article> <article class="feature-card"> <div class="feature-icon" aria-hidden="true"> <svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z"/><path d="M12 7v5l3 2"/></svg> </div> <h3>Libreria personale</h3> <p>Ogni prompt viene salvato in locale: ritrova, copia e rigenera le tue idee anche dopo aver chiuso la pagina.</p> </article> <article class="feature-card"> <div class="feature-icon" aria-hidden="true"> <svg viewBox="0 0 24 24"><path d="M4 5h16v11H4z"/><path d="M8 20h8M12 16v4"/></svg> </div> <h3>Formati per ogni piattaforma</h3> <p>Orizzontale, verticale per Reels e TikTok, CinemaScope o quadrato: il formato giusto fin dal primo tentativo.</p> </article> <article class="feature-card"> <div class="feature-icon" aria-hidden="true"> <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg> </div> <h3>Bilingue IT / EN</h3> <p>Scrivi l'idea in italiano e scegli se ottenere il prompt in inglese — la lingua che i modelli capiscono meglio — o in italiano.</p> </article> <article class="feature-card"> <div class="feature-icon" aria-hidden="true"> <svg viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/></svg> </div> <h3>Privacy reale</h3> <p>Il motore locale funziona senza account e senza inviare nulla in rete. L'API esterna è opzionale e la configuri tu.</p> </article> </div> </section>
-<!-- PREZZI --> <section id="prezzi" aria-labelledby="prezziTitle"> <h2 id="prezziTitle">Semplice, come dovrebbe <span>essere</span></h2> <div class="pricing-grid"> <div class="pricing-card"> <h3>Free</h3> <div class="price">0 €</div> <p class="pricing-sub">Per sempre. Nessuna carta.</p> <ul> <li>Prompt cinematografici illimitati</li> <li>8 stili visivi</li> <li>5 formati video</li> <li>Libreria locale (20 prompt)</li> <li>Copia e download .txt</li> </ul> <button class="btn-trasforma" type="button" data-scroll="generatore">Inizia gratis</button> </div> <div class="pricing-card pro"> <h3>Pro</h3> <div class="price">9 € <small>/ mese</small></div> <p class="pricing-sub">Per chi crea ogni giorno.</p> <ul> <li>Tutto del piano Free</li> <li>Libreria illimitata e ricerca</li> <li>Stili e preset esclusivi</li> <li>Prompt in batch (fino a 10 scene)</li> <li>Supporto prioritario</li> </ul> <button class="btn-trasforma" type="button" data-toast="Il piano Pro arriverà presto: iscriviti dalla pagina Instagram per essere avvisato.">Passa a Pro</button> </div> </div> </section>
-<!-- CTA --> <div class="cta-section"> <h2>La prossima scena parte da <span class="gradient-text">una frase</span></h2> <p>Scrivi l'idea che hai in testa. Al resto pensa la direzione della fotografia.</p> <button class="btn-trasforma" type="button" data-scroll="generatore" style="max-width:280px;margin:0 auto;">Crea il tuo prompt</button> </div> </div> </main>
-<footer> <div class="container"> <div class="footer-grid"> <div class="footer-col footer-brand"> <a class="logo" href="#top"> <span class="logo-mark" aria-hidden="true">P</span> PromptAI Cinema </a> <p>Prompt cinematografici per la nuova generazione di registi.</p> </div> <div class="footer-col"> <h4>Prodotto</h4> <a href="#generatore">Generatore</a> <a href="#galleria">Galleria</a> <a href="#prezzi">Prezzi</a> </div> <div class="footer-col"> <h4>Risorse</h4> <a href="#funzioni">Funzioni</a> <a href="#libreria">Libreria</a> <a href="#apiSettings">API</a> </div> <div class="footer-col"> <h4>Seguici</h4> <a href="https://www.instagram.com/" target="_blank" rel="noopener">Instagram</a> <a href="mailto:ciao@promptaicinema.it">ciao@promptaicinema.it</a> </div> </div> <div class="copyright"> © <span id="year">2026</span> PromptAI Cinema · Demo dimostrativa · Nessun dato inviato senza il tuo consenso </div> </div> </footer>
-<div class="toast-wrap" id="toastWrap" aria-live="polite" aria-atomic="false"></div>
-<script> (function () { 'use strict';
-/* ============================================================ DATI: stili, inquadrature, lenti, movimenti ============================================================ */ const STYLES = { cinematico: { en: { look: 'shot on an ARRI Alexa 65 with anamorphic Panavision lenses', light: 'motivated practical lighting, a soft key and a warm rim light', grade: 'a teal-and-orange grade with soft filmic contrast', ref: 'in the visual language of Roger Deakins and Denis Villeneuve' }, it: { look: 'girato in ARRI Alexa 65 con lenti anamorfiche Panavision', light: 'luce pratica motivata, key morbida e controluce caldo', grade: 'color grading teal-and-orange con contrasto filmico morbido', ref: 'nel linguaggio visivo di Roger Deakins e Denis Villeneuve' } }, noir: { en: { look: 'high-contrast black-and-white 35mm photography with chiaroscuro lighting', light: 'hard sidelight cutting through venetian blinds, deep black shadows', grade: 'monochrome, crushed blacks and silver highlights', ref: 'in the style of classic 1940s film noir' }, it: { look: 'fotografia 35mm in bianco e nero ad alto contrasto, luci chiaroscurali', light: 'luce laterale dura attraverso le tapparelle, ombre nere profonde', grade: 'monocromatico, neri schiacciati e alte luci argentate', ref: 'nello stile del film noir classico anni Quaranta' } }, scifi: { en: { look: 'neon-drenched cyberpunk cinematography with anamorphic lens flares', light: 'cyan and magenta practicals, wet reflections, volumetric fog', grade: 'cyan-magenta split tone with high saturation and deep blues', ref: 'in the world-building style of Blade Runner 2049' }, it: { look: 'cinematografia cyberpunk intrisa di neon con flare anamorfici', light: 'luci pratiche ciano e magenta, riflessi bagnati, nebbia volumetrica', grade: 'split tone ciano-magenta, saturazione alta e blu profondi', ref: 'nella costruzione visiva di Blade Runner 2049' } }, horror: { en: { look: 'desaturated 16mm photography with unsettling stillness', light: 'a single practical lamp, oppressive darkness and cold moonlight', grade: 'desaturated greens and browns with lifted blacks', ref: 'in the restrained dread of Ari Aster and Robert Eggers' }, it: { look: 'fotografia 16mm desaturata, quiete inquietante', light: 'una sola lampada pratica, buio opprimente e chiaro di luna freddo', grade: 'verdi e marroni desaturati con neri alzati', ref: 'nel terrore trattenuto di Ari Aster e Robert Eggers' } }, documentario: { en: { look: 'handheld documentary realism on 16mm, available light only', light: 'natural available light, overcast sky, no stylization', grade: 'neutral, true-to-life color', ref: 'in the observational tradition of Frederick Wiseman' }, it: { look: 'realismo documentaristico a mano in 16mm, solo luce disponibile', light: 'luce naturale disponibile, cielo coperto, nessuna stilizzazione', grade: 'colore neutro, fedele alla realtà', ref: 'nella tradizione osservativa di Frederick Wiseman' } }, anime: { en: { look: 'hand-painted anime cel animation with luminous painted skies', light: 'golden-hour glow, soft bloom and painterly highlights', grade: 'saturated pastel palette with luminous blues', ref: 'in the style of Makoto Shinkai and Studio Ghibli' }, it: { look: 'animazione anime cel dipinta a mano, cieli luminosi', light: "bagliore dell'ora d'oro, bloom morbido, alte luci pittoriche", grade: 'palette pastello satura con blu luminosi', ref: 'nello stile di Makoto Shinkai e Studio Ghibli' } }, vintage: { en: { look: 'Super 8 and Kodak Portra 400 film, halation and light leaks', light: 'warm tungsten light, sun flare, imperfect exposure', grade: 'warm faded tones with a yellow cast and soft contrast', ref: 'like a 1970s Kodachrome home movie' }, it: { look: 'pellicola Super 8 e Kodak Portra 400, aloni e infiltrazioni di luce', light: 'luce calda al tungsteno, flare solare, esposizione imperfetta', grade: 'toni caldi sbiaditi con dominante gialla e contrasto morbido', ref: 'come un filmino Kodachrome anni Settanta' } }, fantasy: { en: { look: 'epic large-format fantasy cinematography', light: 'golden-hour backlight, god rays through mist', grade: 'rich earth tones with golden highlights', ref: 'in the epic scope of The Lord of the Rings' }, it: { look: 'cinematografia fantasy epica in grande formato', light: "controluce dell'ora d'oro, raggi di luce nella nebbia", grade: 'toni della terra ricchi con alte luci dorate', ref: "nell'ampiezza epica de Il Signore degli Anelli" } } };
-const SHOTS = { en: ['wide establishing shot', 'medium close-up', 'extreme close-up', 'low-angle hero shot', 'over-the-shoulder shot', 'slow dolly-in', 'descending crane shot', 'tracking shot from behind'], it: ['campo lunghissimo', 'primo piano medio', 'primissimo piano', 'inquadratura eroica dal basso', 'inquadratura sopra la spalla', 'carrello lento in avanti', 'gru che scende', 'carrello inseguimento da dietro'] };
-const LENSES = ['24mm', '35mm', '50mm', '85mm', '135mm'];
-const MOVES = { en: ['a slow push-in', 'a handheld follow', 'a gentle orbit', 'a locked-off tripod', 'a subtle handheld drift'], it: ['carrello lento in avanti', 'seguito a mano', 'orbita leggera', 'camera fissa su cavalletto', 'leggera deriva a mano'] };
-const AMBIENT = { blueHour: { en: 'at blue hour', it: "nell'ora blu" }, goldenHour: { en: 'at golden hour', it: "nell'ora d'oro" }, midday: { en: 'at harsh midday', it: 'a mezzogiorno, con luce dura' }, rainNight: { en: 'on a rain-soaked night', it: 'in una notte bagnata dalla pioggia' }, mist: { en: 'in pre-dawn mist', it: "nella nebbia prima dell'alba" }, overcast: { en: 'on an overcast morning', it: 'in una mattina di cielo coperto' } };
-const AMBIENT_BY_STYLE = { cinematico: ['blueHour', 'goldenHour', 'mist'], noir: ['rainNight', 'blueHour'], scifi: ['rainNight', 'blueHour'], horror: ['mist', 'rainNight'], documentario: ['overcast', 'midday'], anime: ['goldenHour', 'blueHour'], vintage: ['goldenHour', 'midday'], fantasy: ['goldenHour', 'mist'] };
-const MOODS = { en: ['quiet tension', 'melancholic wonder', 'restrained intimacy', 'electric anticipation', 'haunting calm'], it: ['tensione silenziosa', 'meraviglia malinconica', 'intimità trattenuta', 'attesa elettrica', 'calma inquietante'] };
-const TEXTURES = { en: ['fine 35mm grain', 'clean digital capture with subtle halation', '16mm grain with soft edges', 'crisp large-format detail'], it: ['grana fine 35mm', 'ripresa digitale pulita con leggero alone', 'grana 16mm con bordi morbidi', 'dettaglio grande formato nitido'] };
-const LABELS = { en: { header: 'CINEMATIC PROMPT', shot: 'SHOT', lens: 'LENS', movement: 'MOVEMENT', lighting: 'LIGHTING', color: 'COLOR', texture: 'TEXTURE', mood: 'MOOD', format: 'FORMAT', style: 'STYLE', negative: 'NEGATIVE', duration: 'duration', negativeList: 'text, watermark, logo, distorted anatomy, extra limbs, flickering, morphing artifacts, low resolution' }, it: { header: 'PROMPT CINEMATOGRAFICO', shot: 'INQUADRATURA', lens: 'OBIETTIVO', movement: 'MOVIMENTO', lighting: 'LUCE', color: 'COLORE', texture: 'TEXTURE', mood: 'ATMOSFERA', format: 'FORMATO', style: 'STILE', negative: 'NEGATIVO', duration: 'durata', negativeList: 'testo, watermark, logo, anatomia distorta, arti in più, sfarfallio, artefatti di morphing, bassa risoluzione' } };
-/* ============================================================ UTILITÀ ============================================================ */ const $ = (sel) => document.querySelector(sel); const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
-function toast(message, type) { const wrap = $('#toastWrap'); const el = document.createElement('div'); el.className = 'toast' + (type === 'error' ? ' error' : ''); el.textContent = message; wrap.appendChild(el); setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity 0.3s'; setTimeout(() => el.remove(), 300); }, 3400); }
-function capitalize(text) { const t = text.trim(); if (!t) return t; return t.charAt(0).toUpperCase() + t.slice(1); }
-function stripFinalDot(text) { return text.trim().replace(/[.!?]+$/, ''); }
-/* ============================================================ MOTORE LOCALE ============================================================ */ let currentLang = 'en';
-function buildPrompt(idea, styleKey, ratio, lang) { const style = STYLES[styleKey] || STYLES.cinematico; const s = style[lang]; const L = LABELS[lang];
-const shot = pick(SHOTS[lang]); const lens = pick(LENSES); const move = pick(MOVES[lang]); const ambientKey = pick(AMBIENT_BY_STYLE[styleKey] || Object.keys(AMBIENT)); const ambient = AMBIENT[ambientKey][lang]; const mood = pick(MOODS[lang]); const texture = pick(TEXTURES[lang]);
-const subject = stripFinalDot(idea); const opening = lang === 'en' ? `${capitalize(subject)}. ${capitalize(shot)} on a ${lens} lens, ${move}.` : `${capitalize(subject)}. ${capitalize(shot)} con obiettivo ${lens}, ${move}.`;
-const prose = lang === 'en' ? `${opening} ${capitalize(s.look)}. ${capitalize(s.light)}. ${capitalize(s.grade)}, ${texture}, ${ambient}. The mood is ${mood}. ${capitalize(s.ref)}.` : `${opening} ${capitalize(s.look)}. ${capitalize(s.light)}. ${capitalize(s.grade)}, ${texture}, ${ambient}. L'atmosfera è ${mood}. ${capitalize(s.ref)}.`;
-const lines = [ L.header, '─'.repeat(28), prose, '', `${L.shot}: ${shot}`, `${L.lens}: ${lens}${lang === 'en' ? ', shallow depth of field' : ', profondità di campo ridotta'}`, `${L.movement}: ${move}`, `${L.lighting}: ${s.light}`, `${L.color}: ${s.grade}`, `${L.texture}: ${texture}`, `${L.mood}: ${mood}`, `${L.format}: ${ratio} · 10s · 24fps`, `${L.style}: ${s.ref}`, `${L.negative}: ${L.negativeList}` ];
-return lines.join('\n'); }
-/* ============================================================ API REMOTA (opzionale) ============================================================ */ const API_KEY_STORAGE = 'pac_api_config';
-function getApiConfig() { try { return JSON.parse(localStorage.getItem(API_KEY_STORAGE) || 'null'); } catch (e) { return null; } }
-async function generateWithApi(idea, styleKey, ratio, lang) { const cfg = getApiConfig(); if (!cfg || !cfg.key || !cfg.endpoint) return null;
-const styleLabel = STYLES[styleKey] ? styleKey : 'cinematico'; const system = [ 'You are a professional cinematographer and prompt engineer.', 'Convert the user idea into one production-ready prompt for an AI video generator.', 'Include subject, action, setting, camera angle, lens, camera movement, lighting, color grade, texture, mood, aspect ratio and a short negative prompt.', 'Return only the prompt text, no explanations, no markdown fences.', 'Reply in ' + (lang === 'it' ? 'Italian.' : 'English.') ].join(' ');
-const user = `Idea: ${idea}\nVisual style: ${styleLabel}\nAspect ratio: ${ratio}\nDuration: 10 seconds.`;
-const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 30000);
-try { const res = await fetch(cfg.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.key }, body: JSON.stringify({ model: cfg.model || 'gpt-4o-mini', temperature: 0.85, messages: [ { role: 'system', content: system }, { role: 'user', content: user } ] }), signal: controller.signal });
-if (!res.ok) throw new Error('HTTP ' + res.status); const data = await res.json(); const text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content; if (!text) throw new Error('Risposta vuota'); return text.trim(); } finally { clearTimeout(timeout); } }
-/* ============================================================ STATO E RENDER ============================================================ */ const HISTORY_KEY = 'pac_history'; let lastPrompt = '';
-function loadHistory() { try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch (e) { return []; } }
-function saveHistory(items) { try { localStorage.setItem(HISTORY_KEY, JSON.stringify(items.slice(0, 20))); } catch (e) { /* quota superata: ignora */ } }
-function addToHistory(entry) { const items = loadHistory(); items.unshift(entry); saveHistory(items); renderHistory(); }
-function formatDate(iso) { try { return new Date(iso).toLocaleString('it-IT', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } }
-function renderHistory() { const list = $('#historyList'); const toolbar = $('#historyToolbar'); const items = loadHistory();
-list.innerHTML = '';
-if (!items.length) { toolbar.hidden = true; const empty = document.createElement('p'); empty.className = 'empty-state'; empty.textContent = 'La tua libreria è vuota. Genera il primo prompt e lo troverai qui, salvato solo su questo dispositivo.'; list.appendChild(empty); return; }
-toolbar.hidden = false;
-items.forEach((item) => { const el = document.createElement('article'); el.className = 'history-item'; el.tabIndex = 0; el.setAttribute('role', 'button'); el.setAttribute('aria-label', 'Riapri il prompt: ' + item.idea);
-const promptRow = document.createElement('div'); promptRow.className = 'history-prompt';
-const tag = document.createElement('span'); tag.className = 'history-tag'; tag.textContent = item.styleLabel || item.style || 'Prompt';
-const ideaText = document.createElement('span'); ideaText.textContent = item.idea;
-promptRow.appendChild(tag); promptRow.appendChild(ideaText);
-const result = document.createElement('div'); result.className = 'history-result'; result.textContent = item.result.replace(/\n+/g, ' ').slice(0, 220);
-const date = document.createElement('div'); date.className = 'history-date'; date.textContent = formatDate(item.date);
-el.appendChild(promptRow); el.appendChild(result); el.appendChild(date);
-const open = () => { $('#resultContent').textContent = item.result; $('#resultSection').classList.add('show'); lastPrompt = item.result; $('#resultSection').scrollIntoView({ behavior: 'smooth', block: 'center' }); };
-el.addEventListener('click', open); el.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); } });
-list.appendChild(el); }); }
-/* ============================================================ GENERAZIONE ============================================================ */ const form = $('#promptForm'); const ideaInput = $('#idea'); const charCount = $('#charCount'); const generateBtn = $('#generateBtn'); const generateLabel = $('#generateLabel'); const resultSection = $('#resultSection'); const resultContent = $('#resultContent');
-ideaInput.addEventListener('input', () => { const len = ideaInput.value.length; charCount.textContent = len + ' / 600'; charCount.classList.toggle('limit', len > 560); });
-document.querySelectorAll('.segmented button').forEach((btn) => { btn.addEventListener('click', () => { currentLang = btn.dataset.lang; document.querySelectorAll('.segmented button').forEach((b) => { b.setAttribute('aria-pressed', String(b === btn)); }); if (lastPrompt) { toast(currentLang === 'en' ? 'Lingua impostata su inglese: rigenera per applicarla.' : 'Lingua impostata su italiano: rigenera per applicarla.'); } }); });
-async function generate(useApi) { const idea = ideaInput.value.trim();
-if (idea.length < 3) { ideaInput.classList.add('shake'); ideaInput.focus(); setTimeout(() => ideaInput.classList.remove('shake'), 450); toast('Scrivi almeno una frase per descrivere la scena.', 'error'); return; }
-const styleKey = $('#style').value; const ratio = $('#ratio').value;
-generateBtn.disabled = true; generateBtn.classList.add('loading'); generateLabel.textContent = 'Elaborazione…';
-let prompt = null; let usedApi = false;
-if (useApi) { try { prompt = await generateWithApi(idea, styleKey, ratio, currentLang); usedApi = !!prompt; } catch (err) { toast('API non raggiungibile (' + err.message + '). Uso il motore locale.', 'error'); } }
-if (!prompt) { await new Promise((r) => setTimeout(r, 550)); prompt = buildPrompt(idea, styleKey, ratio, currentLang); }
-lastPrompt = prompt; resultContent.textContent = prompt; resultSection.classList.add('show');
-const styleLabel = $('#style').selectedOptions[0] ? $('#style').selectedOptions[0].textContent : styleKey;
-addToHistory({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), idea: idea, style: styleKey, styleLabel: styleLabel, result: prompt, date: new Date().toISOString() });
-generateBtn.disabled = false; generateBtn.classList.remove('loading'); generateLabel.textContent = 'Trasforma in prompt';
-$('#copiedMsg').classList.remove('show');
-if (usedApi) toast('Prompt generato con la tua API.');
-resultSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
-form.addEventListener('submit', (ev) => { ev.preventDefault(); const cfg = getApiConfig(); generate(!!(cfg && cfg.key && cfg.endpoint)); });
-/* ============================================================ AZIONI SUL RISULTATO ============================================================ */ async function copyText(text) { try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return true; } } catch (e) { /* fallback sotto */ }
-const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px'; document.body.appendChild(ta); ta.select(); let ok = false; try { ok = document.execCommand('copy'); } catch (e) { ok = false; } ta.remove(); return ok; }
-$('#copyBtn').addEventListener('click', async () => { if (!lastPrompt) return; const ok = await copyText(lastPrompt); if (ok) { const msg = $('#copiedMsg'); msg.classList.add('show'); setTimeout(() => msg.classList.remove('show'), 2200); } else { toast('Copia non riuscita: seleziona il testo manualmente.', 'error'); } });
-$('#regenBtn').addEventListener('click', () => { if (!lastPrompt) return; const cfg = getApiConfig(); generate(!!(cfg && cfg.key && cfg.endpoint)); });
-$('#downloadBtn').addEventListener('click', () => { if (!lastPrompt) return; const blob = new Blob([lastPrompt], { type: 'text/plain;charset=utf-8' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'prompt-cinematografico.txt'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); toast('File .txt scaricato.'); });
-/* ============================================================ IMPOSTAZIONI API ============================================================ */ function loadApiSettings() { const cfg = getApiConfig(); if (!cfg) return; $('#apiEndpoint').value = cfg.endpoint || ''; $('#apiModel').value = cfg.model || ''; $('#apiKey').value = cfg.key || ''; $('#apiStatus').textContent = 'Configurazione attiva: il prompt verrà generato via API.'; }
-$('#saveApiBtn').addEventListener('click', () => { const endpoint = $('#apiEndpoint').value.trim(); const key = $('#apiKey').value.trim(); const model = $('#apiModel').value.trim();
-if (!endpoint || !key) { toast('Inserisci endpoint e chiave API, oppure lascia vuoto per il motore locale.', 'error'); return; }
-try { localStorage.setItem(API_KEY_STORAGE, JSON.stringify({ endpoint, key, model })); $('#apiStatus').textContent = 'Configurazione salvata. Il prompt verrà generato via API.'; toast('Impostazioni API salvate.'); } catch (e) { toast('Impossibile salvare le impostazioni in questo browser.', 'error'); } });
-$('#clearApiBtn').addEventListener('click', () => { localStorage.removeItem(API_KEY_STORAGE); $('#apiEndpoint').value = ''; $('#apiModel').value = ''; $('#apiKey').value = ''; $('#apiStatus').textContent = 'Configurazione rimossa: è attivo il motore locale.'; toast('Impostazioni API rimosse.'); });
-/* ============================================================ LIBRERIA ============================================================ */ $('#clearHistoryBtn').addEventListener('click', () => { if (!loadHistory().length) return; localStorage.removeItem(HISTORY_KEY); renderHistory(); toast('Libreria svuotata.'); });
-/* ============================================================ UI: menu, scroll, galleria, reveal ============================================================ */ const mobileToggle = $('#mobileToggle'); const navLinks = $('#navLinks');
-mobileToggle.addEventListener('click', () => { const open = navLinks.classList.toggle('open'); mobileToggle.setAttribute('aria-expanded', String(open)); mobileToggle.textContent = open ? '✕' : '☰'; });
-navLinks.querySelectorAll('a, button').forEach((el) => { el.addEventListener('click', () => { navLinks.classList.remove('open'); mobileToggle.setAttribute('aria-expanded', 'false'); mobileToggle.textContent = '☰'; }); });
-$('#loginBtn').addEventListener('click', () => { $('#generatore').scrollIntoView({ behavior: 'smooth', block: 'center' }); toast('Nessun account necessario: il generatore è gratuito e funziona nel browser.'); });
-document.querySelectorAll('[data-scroll]').forEach((btn) => { btn.addEventListener('click', () => { const target = document.getElementById(btn.dataset.scroll); if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' }); }); });
-document.querySelectorAll('[data-toast]').forEach((btn) => { btn.addEventListener('click', () => toast(btn.dataset.toast)); });
-document.querySelectorAll('a[href="#apiSettings"]').forEach((link) => { link.addEventListener('click', () => { const details = document.getElementById('apiSettings'); if (details) details.open = true; }); });
-document.querySelectorAll('.gallery-item').forEach((item) => { item.addEventListener('click', () => { ideaInput.value = item.dataset.idea || ''; ideaInput.dispatchEvent(new Event('input')); $('#generatore').scrollIntoView({ behavior: 'smooth', block: 'center' }); ideaInput.focus({ preventScroll: true }); toast('Idea caricata: scegli lo stile e genera il prompt.'); }); });
-if ('IntersectionObserver' in window) { const observer = new IntersectionObserver((entries) => { entries.forEach((entry) => { if (entry.isIntersecting) { entry.target.classList.add('visible'); observer.unobserve(entry.target); } }); }, { threshold: 0.12 });
-document.querySelectorAll('.reveal').forEach((el) => observer.observe(el)); } else { document.querySelectorAll('.reveal').forEach((el) => el.classList.add('visible')); }
-/* ============================================================ INIT ============================================================ */ $('#year').textContent = new Date().getFullYear(); renderHistory(); loadApiSettings(); })(); </script><script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-<script>
-window.addEventListener('load',()=>{
-  const h1=document.querySelector('h1');
-  if(!h1) return;
-  const el=document.createElement('div');
-  el.style.cssText='width:100%;height:240px;margin:0 auto';
-  h1.parentNode.insertBefore(el,h1);
-  const scene=new THREE.Scene();
-  const cam=new THREE.PerspectiveCamera(45,el.clientWidth/el.clientHeight,0.1,100);
-  cam.position.z=5;
-  const r=new THREE.WebGLRenderer({alpha:true,antialias:true});
-  r.setSize(el.clientWidth,el.clientHeight);
-  r.setPixelRatio(Math.min(devicePixelRatio,2));
-  el.appendChild(r.domElement);
-  const a=new THREE.Mesh(new THREE.TorusKnotGeometry(1,0.3,120,16),
-    new THREE.MeshBasicMaterial({color:0x22d3ee,wireframe:true}));
-  const b=new THREE.Mesh(new THREE.IcosahedronGeometry(0.5,1),
-    new THREE.MeshBasicMaterial({color:0xf472b6,wireframe:true}));
-  scene.add(a,b);
-  (function loop(){
-    a.rotation.x+=0.006; a.rotation.y+=0.01;
-    b.rotation.y-=0.015;
-    r.render(scene,cam); requestAnimationFrame(loop);
-  })();
-});
-</script></body></html><script defer src="/_vercel/insights/script.js"></script>
-  b
-
-xx
+</body>
+</html>
