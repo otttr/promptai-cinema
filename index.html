@@ -4,7 +4,6 @@
   window.dataLayer = window.dataLayer || [];
   function gtag(){dataLayer.push(arguments);}
   gtag('js', new Date());
-
   gtag('config', 'G-3G1QY5R49T');
 </script><!-- Sfondo animato Shader -->
 <canvas id="shader-canvas" style="
@@ -15,22 +14,18 @@
   height: 100vh;
   z-index: -1;
 "></canvas>
-
 <script>
 const canvas = document.getElementById('shader-canvas');
 const gl = canvas.getContext('webgl');
-
 if (gl) {
   const vsSource = `
     attribute vec4 aVertexPosition;
     void main() { gl_Position = aVertexPosition; }
   `;
-
   const fsSource = `
     precision highp float;
     uniform vec2 iResolution;
     uniform float iTime;
-
     const float overallSpeed = 0.2;
     const float gridSmoothWidth = 0.015;
     const float axisWidth = 0.05;
@@ -53,34 +48,26 @@ if (gl) {
     const float minOffsetSpread = 0.6;
     const float maxOffsetSpread = 2.0;
     const int linesPerGroup = 16;
-
     #define drawCircle(pos, radius, coord) smoothstep(radius + gridSmoothWidth, radius, length(coord - (pos)))
     #define drawSmoothLine(pos, halfWidth, t) smoothstep(halfWidth, 0.0, abs(pos - (t)))
     #define drawCrispLine(pos, halfWidth, t) smoothstep(halfWidth + gridSmoothWidth, halfWidth, abs(pos - (t)))
     #define drawPeriodicLine(freq, width, t) drawCrispLine(freq / 2.0, width, abs(mod(t, freq) - (freq) / 2.0))
-
     float random(float t) {
       return (cos(t) + cos(t * 1.3 + 1.3) + cos(t * 1.4 + 1.4)) / 3.0;
     }
-
     float getPlasmaY(float x, float hFade, float offset) {
       return random(x * lineFrequency + iTime * lineSpeed) * hFade * lineAmplitude + offset;
     }
-
     void main() {
       vec2 uv = gl_FragCoord.xy / iResolution.xy;
       vec2 space = (gl_FragCoord.xy - iResolution.xy * 0.5) / iResolution.x * 2.0 * scale;
-
       float hFade = 1.0 - (cos(uv.x * 6.28) * 0.5 + 0.5);
       float vFade = 1.0 - (cos(uv.y * 6.28) * 0.5 + 0.5);
-
       space.y += random(space.x * warpFrequency + iTime * warpSpeed) * warpAmplitude * (0.5 + hFade);
       space.x += random(space.y * warpFrequency + iTime * warpSpeed + 2.0) * warpAmplitude * hFade;
-
       vec4 lines = vec4(0.0);
       vec4 bg1 = vec4(0.1, 0.1, 0.3, 1.0);
       vec4 bg2 = vec4(0.3, 0.1, 0.5, 1.0);
-
       for(int l = 0; l < linesPerGroup; l++) {
         float n = float(l) / float(linesPerGroup);
         float offT = iTime * offsetSpeed;
@@ -90,14 +77,11 @@ if (gl) {
         float off = random(offPos + offT * (1.0 + n)) * mix(minOffsetSpread, maxOffsetSpread, hFade);
         float lineY = getPlasmaY(space.x, hFade, off);
         float line = drawSmoothLine(lineY, halfW, space.y) * 0.5 + drawCrispLine(lineY, halfW * 0.15, space.y);
-
         float circX = mod(float(l) + iTime * lineSpeed, 25.0) - 12.0;
         vec2 circPos = vec2(circX, getPlasmaY(circX, hFade, off));
         float circ = drawCircle(circPos, 0.01, space) * 4.0;
-
         lines += (line + circ) * lineColor * rand;
       }
-
       vec4 col = mix(bg1, bg2, uv.x);
       col *= vFade;
       col.a = 1.0;
@@ -105,7 +89,6 @@ if (gl) {
       gl_FragColor = col;
     }
   `;
-
   function loadShader(gl, type, src) {
     const s = gl.createShader(type);
     gl.shaderSource(s, src);
@@ -113,22 +96,18 @@ if (gl) {
     if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { gl.deleteShader(s); return null; }
     return s;
   }
-
   const vs = loadShader(gl, gl.VERTEX_SHADER, vsSource);
   const fs = loadShader(gl, gl.FRAGMENT_SHADER, fsSource);
   const prog = gl.createProgram();
   gl.attachShader(prog, vs);
   gl.attachShader(prog, fs);
   gl.linkProgram(prog);
-
   const buf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, buf);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
-
   const posLoc = gl.getAttribLocation(prog, 'aVertexPosition');
   const resLoc = gl.getUniformLocation(prog, 'iResolution');
   const timeLoc = gl.getUniformLocation(prog, 'iTime');
-
   function resize() {
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
@@ -136,7 +115,6 @@ if (gl) {
   }
   resize();
   window.addEventListener('resize', resize);
-
   const start = Date.now();
   function render() {
     const t = (Date.now() - start) / 1000;
@@ -474,30 +452,23 @@ const a = new THREE.Mesh(g, [
     specular: 0x9988ff
   })
 ]);
-
 a.add(new THREE.LineSegments(new THREE.EdgesGeometry(g),
-  new THREE.LineBasicMaterial({color:0x000000})));
- 
+  new THREE.LineBasicMaterial({color:0x000000}))); 
 // ✅ INCOLLA QUI SOTTO IL CODICE DELLA LUCE ✅
-
 // 💡 Luce principale
 const luce1 = new THREE.DirectionalLight(0xffffff, 1.5);
 luce1.position.set(5, 10, 7);
 scene.add(luce1);
-
 // 💡 Luce secondaria viola
 const luce2 = new THREE.DirectionalLight(0xc4b5fd, 0.6);
 luce2.position.set(-5, 5, -5);
 scene.add(luce2);
-
 // 💡 Luce ambientale
 const luceAmbientale = new THREE.AmbientLight(0xffffff, 0.5);
 scene.add(luceAmbientale);
-
   scene.add(a);
   (function loop(){
     a.rotation.y+=0.01;
-  
     r.render(scene,cam); requestAnimationFrame(loop);
   })();
 });
