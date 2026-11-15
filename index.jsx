@@ -1,0 +1,8996 @@
+import { createClient } from "@base44/sdk";
+import { getAppParams } from "@/lib/app-params";
+
+const { appId, token, functionsVersion, appBaseUrl } = getAppParams();
+
+export const base44 = createClient({ appId, token: token ?? undefined, functionsVersion, serverUrl: "", appBaseUrl });
+import { redirect } from "@tanstack/react-router";
+import { DefaultCatchBoundary } from "@/components/DefaultCatchBoundary";
+import { UserNotRegistered } from "@/components/auth/UserNotRegistered";
+import { authQuery } from "@/lib/AuthContext";
+
+class NotRegisteredError extends Error {}
+
+/**
+ * The login gate for a pathless layout route (src/routes/_authed.jsx), which gates
+ * every route under src/routes/_authed/ (their URLs carry no "_authed" segment):
+ *
+ *   createFileRoute("/_authed")({ ssr: false, beforeLoad: requireSignedIn, errorComponent: AuthGateError })
+ *
+ * TanStack Router's authenticated-routes pattern: beforeLoad reads the visitor from the
+ * router context (the QueryClient's cached `authQuery`, shared with useAuth()), so a
+ * child's loader never runs as an anonymous visitor. Signed out → /login with the way
+ * back; signed in but not a user of this app → the not-registered screen. Children read
+ * the visitor with `Route.useRouteContext().user`. `ssr: false` — the server is anonymous,
+ * so these pages render in the browser only, and children inherit that.
+ */
+export async function requireSignedIn({ context, location }) {
+  // A /me outage (429, 503) is not a sign-out: it rejects here and reaches the error
+  // boundary, whose "Try again" asks the server again (a failed query caches nothing).
+  const { user, error } = await context.queryClient.ensureQueryData(authQuery);
+  if (user) return { user };
+  // Thrown rather than returned so the children's loaders never run without a user.
+  if (error?.type === "user_not_registered") throw new NotRegisteredError(error.message);
+  // A document navigation on purpose: an app served behind the platform login gets the
+  // platform's /login, which reads from_url; the app's own /login page reads returnTo.
+  throw redirect({ to: "/login", search: { returnTo: location.href, from_url: location.href }, reloadDocument: true });
+}
+
+export function AuthGateError({ error }) {
+  return error instanceof NotRegisteredError ? <UserNotRegistered /> : <DefaultCatchBoundary error={error} />;
+}
+// Full-screen card shared by the auth pages; it sets its own color tokens so it stays readable under any theme.
+export function AuthLayout({ icon: Icon, title, subtitle, footer, children }) {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-background px-4 py-8 text-foreground">
+      <div className="w-full max-w-md">
+        <div className="mb-8 text-center">
+          <div className="mb-4 inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-primary">
+            <Icon className="h-7 w-7 text-primary-foreground" aria-hidden="true" />
+          </div>
+          <h1 className="text-3xl font-bold tracking-tight">{title}</h1>
+          {subtitle && <p className="mt-2 text-muted-foreground">{subtitle}</p>}
+        </div>
+        <div className="rounded-2xl border border-border bg-card p-8 text-card-foreground shadow-sm">{children}</div>
+        {footer && <p className="mt-6 text-center text-sm text-muted-foreground">{footer}</p>}
+      </div>
+    </div>
+  );
+}
+import { getAccessToken } from "@base44/sdk";
+import { Loader2, ShieldCheck } from "lucide-react";
+import { Fragment, useEffect, useState } from "react";
+import { AuthLayout } from "@/components/auth/AuthLayout";
+import { Button } from "@/components/ui/button";
+import { getAppParams } from "@/lib/app-params";
+
+// The /oauth/consent page: app-side OAuth consent for the app's MCP server. The platform redirects
+// AI clients here (base44/mcp/config.json `consent_path`, default /oauth/consent)
+// with an opaque `ctx` handle — the authorization request itself lives on the
+// server. The page gates on the app-user session, fetches the display info for
+// the handle, shows what is being granted and posts the approve/deny decision.
+// It handles the signed-out case itself, so its route must stay OUTSIDE _authed/.
+// Do not change the fetch calls, headers or the `ctx` handling — styling and
+// copy are safe to edit.
+const authHeaders = () => {
+  // Cookie-backed sessions carry no token; "Bearer null" would shadow the valid
+  // cookie, so send the header only when a token exists.
+  const token = getAccessToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+};
+
+const loginRedirect = (loginPath, ctx) => {
+  // The handle rides back in returnTo (our pages) and from_url (the platform
+  // login, which serves an app coerced to platform auth). Rebuild the query
+  // from `ctx` alone — never forward the raw location.search.
+  const returnTo = window.location.pathname + "?ctx=" + encodeURIComponent(ctx);
+  const encoded = encodeURIComponent(returnTo);
+  window.location.href = (loginPath || "/login") + "?returnTo=" + encoded + "&from_url=" + encoded;
+};
+
+const OPERATION_VERBS = { read: "view", create: "create", update: "edit", delete: "delete" };
+const COLLAPSED_DATA_ROWS = 6;
+
+// Entity tools arrive one per operation; show each entity once, naming only the
+// operations it actually grants.
+function groupTools(tools) {
+  const operationsByEntity = new Map();
+  const agents = [];
+  const actions = [];
+  for (const tool of tools) {
+    if (tool.kind === "entity" && tool.entity) {
+      if (!operationsByEntity.has(tool.entity)) operationsByEntity.set(tool.entity, []);
+      operationsByEntity.get(tool.entity).push(tool.operation);
+    } else if (tool.kind === "agent") {
+      agents.push(tool);
+    } else {
+      actions.push(tool);
+    }
+  }
+  const data = [...operationsByEntity].map(([entity, operations]) => ({
+    entity,
+    operations: Object.keys(OPERATION_VERBS).filter((op) => operations.includes(op)),
+  }));
+  return { data, agents, actions };
+}
+
+const humanize = (name) =>
+  name.split(/[_-]+/).filter(Boolean).map((word) => word[0].toUpperCase() + word.slice(1)).join(" ") || name;
+
+// "View, create and delete records" — delete is emphasized so it doesn't hide
+// among harmless verbs.
+function OperationSummary({ operations }) {
+  return (
+    <>
+      {operations.map((op, i) => {
+        const verb = OPERATION_VERBS[op];
+        const separator = i === 0 ? "" : i === operations.length - 1 ? " and " : ", ";
+        return (
+          <Fragment key={op}>
+            {separator}
+            <span className={op === "delete" ? "font-medium text-destructive" : undefined}>
+              {i === 0 ? verb[0].toUpperCase() + verb.slice(1) : verb}
+            </span>
+          </Fragment>
+        );
+      })}{" "}
+      records
+    </>
+  );
+}
+
+function ToolSection({ title, children }) {
+  return (
+    <section>
+      <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground mb-2">{title}</h3>
+      <ul className="divide-y divide-border rounded-lg border border-border">{children}</ul>
+    </section>
+  );
+}
+
+function ToolRow({ title, children }) {
+  return (
+    <li className="flex flex-col gap-0.5 px-3 py-2">
+      <span className="font-medium text-foreground">{title}</span>
+      {children && <span className="text-muted-foreground">{children}</span>}
+    </li>
+  );
+}
+
+export function ConsentPage() {
+  // Read raw: the opaque handle must reach the server exactly as the platform sent it.
+  const ctx = new URLSearchParams(window.location.search).get("ctx");
+  const { appId } = getAppParams();
+  const [info, setInfo] = useState(null);
+  const [checking, setChecking] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [decided, setDecided] = useState("");
+  const [error, setError] = useState("");
+  const [reconnect, setReconnect] = useState("");
+  const [showAllData, setShowAllData] = useState(false);
+
+  useEffect(() => {
+    let redirecting = false;
+    (async () => {
+      try {
+        if (!ctx) {
+          setError("This authorization link is invalid or has expired.");
+          return;
+        }
+        // Resolve the handle first: a dead handle must never render approve/deny,
+        // and the response carries the app's configured login route.
+        const res = await fetch(`/api/apps/${appId}/mcp/consent-info?handle=${encodeURIComponent(ctx)}`, {
+          credentials: "include",
+          headers: authHeaders(),
+        });
+        if (!res.ok) {
+          setError("This authorization link is invalid or has expired.");
+          return;
+        }
+        const data = await res.json();
+        // Gate on the server's answer, not on the SDK: a cookie-only session
+        // reads as signed-out client-side but authenticated this request.
+        if (!data.authenticated) {
+          redirecting = true;
+          loginRedirect(data.login_path, ctx);
+          return;
+        }
+        setInfo(data);
+      } catch {
+        setError("Could not load this authorization request. Please try again.");
+      } finally {
+        if (!redirecting) setChecking(false);
+      }
+    })();
+  }, [ctx, appId]);
+
+  const respond = async (action) => {
+    setSubmitting(true);
+    setError("");
+    try {
+      const res = await fetch(`/api/apps/${appId}/mcp/authorize-grant`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ ctx, action }),
+      });
+      if (!res.ok) {
+        // 401: the session expired before the single-use handle was spent — back through login with ctx.
+        if (res.status === 401) {
+          loginRedirect(info?.login_path, ctx);
+          return;
+        }
+        // These come after the handle is consumed (409 tool set changed, 403
+        // mismatch, 404 access gone, 400 used) — retrying can only 404.
+        if ([400, 403, 404, 409].includes(res.status)) {
+          let detail = "";
+          try {
+            detail = (await res.json()).detail;
+          } catch {
+            /* keep default */
+          }
+          setReconnect(detail || "This authorization can no longer be completed. Reconnect from your AI client to try again.");
+          setSubmitting(false);
+          return;
+        }
+        throw new Error("Could not complete authorization. Please try again.");
+      }
+      const data = await res.json();
+      window.location.href = data.redirect_url;
+      if (!/^https?:/i.test(data.redirect_url)) {
+        // Custom-scheme redirects (native AI clients) may not visibly navigate.
+        setDecided(action);
+        setSubmitting(false);
+      }
+    } catch (e) {
+      setError(e.message);
+      setSubmitting(false);
+    }
+  };
+
+  if (checking) {
+    return (
+      <AuthLayout icon={ShieldCheck} title="Authorize access">
+        <div className="flex items-center justify-center py-6 text-muted-foreground">
+          <Loader2 className="mr-2 h-5 w-5 animate-spin" aria-hidden="true" />
+          Loading…
+        </div>
+      </AuthLayout>
+    );
+  }
+
+  const client = info?.client_name || "An AI client";
+  const appName = info?.app_name || "this app";
+
+  if (decided) {
+    return <AuthLayout icon={ShieldCheck} title={decided === "approve" ? "Access granted" : "Access denied"} subtitle={`You can return to ${client} and close this window.`} />;
+  }
+  if (reconnect) {
+    return (
+      <AuthLayout icon={ShieldCheck} title="Reconnect required">
+        <div className="rounded-lg bg-destructive/10 p-3 text-sm text-destructive">{reconnect}</div>
+      </AuthLayout>
+    );
+  }
+  // No consent details means nothing trustworthy to approve.
+  if (error && !info) {
+    return (
+      <AuthLayout icon={ShieldCheck} title="Authorize access">
+        <div className="rounded-lg bg-destructive/10 p-3 text-sm text-destructive">{error}</div>
+      </AuthLayout>
+    );
+  }
+
+  const tools = Array.isArray(info.tools) ? info.tools : [];
+  const { data, agents, actions } = groupTools(tools);
+  return (
+    <AuthLayout icon={ShieldCheck} title="Authorize access" subtitle={`${client} wants to access ${appName} on your behalf`}>
+      {error && <div className="mb-4 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">{error}</div>}
+      <p className="mb-3 text-sm font-medium text-foreground">{tools.length ? `${client} will be able to:` : "No tools requested"}</p>
+      {tools.length > 0 && (
+        <div className="space-y-4 text-sm mb-6">
+          {data.length > 0 && (
+            <ToolSection title={`Data (${data.length})`}>
+              {(showAllData ? data : data.slice(0, COLLAPSED_DATA_ROWS)).map(({ entity, operations }) => (
+                <ToolRow key={entity} title={entity}>
+                  <OperationSummary operations={operations} />
+                </ToolRow>
+              ))}
+              {data.length > COLLAPSED_DATA_ROWS && (
+                <li className="px-3 py-2">
+                  <button
+                    type="button"
+                    className="text-sm font-medium text-primary hover:underline"
+                    onClick={() => setShowAllData((shown) => !shown)}
+                  >
+                    {showAllData ? "Show less" : `Show all ${data.length}`}
+                  </button>
+                </li>
+              )}
+            </ToolSection>
+          )}
+          {agents.length > 0 && (
+            <ToolSection title="Agents">
+              {agents.map((tool) => (
+                <ToolRow key={tool.name} title={tool.agent ? humanize(tool.agent) : tool.title || tool.name}>
+                  {tool.description}
+                </ToolRow>
+              ))}
+            </ToolSection>
+          )}
+          {actions.length > 0 && (
+            <ToolSection title="Actions">
+              {actions.map((tool) => (
+                <ToolRow key={tool.name} title={tool.title || tool.name}>
+                  {tool.description}
+                </ToolRow>
+              ))}
+            </ToolSection>
+          )}
+        </div>
+      )}
+
+      <div className="flex gap-3">
+        <Button variant="outline" className="h-12 flex-1 font-medium" disabled={submitting} onClick={() => respond("deny")}>
+          Deny
+        </Button>
+        <Button className="h-12 flex-1 font-medium" disabled={submitting} onClick={() => respond("approve")}>
+          {submitting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" /> : null}
+          Approve
+        </Button>
+      </div>
+    </AuthLayout>
+  );
+}
+import { ArrowLeft, Mail } from "lucide-react";
+import { useState } from "react";
+import { base44 } from "@/api/base44Client";
+import { AuthLayout } from "@/components/auth/AuthLayout";
+import { AuthLink, SubmitButton } from "@/components/auth/parts";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { safeReturnTo } from "@/lib/authReturnTo";
+
+// The /forgot-password page. Always ends in the generic "if an account exists"
+// message: the API does not reveal whether the email is registered, and neither should the UI.
+export function ForgotPasswordPage() {
+  const returnTo = safeReturnTo();
+  const [email, setEmail] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [sent, setSent] = useState(false);
+
+  async function submit(e) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await base44.auth.resetPasswordRequest(email);
+    } catch {
+      // Same outcome either way.
+    } finally {
+      setBusy(false);
+      setSent(true);
+    }
+  }
+
+  return (
+    <AuthLayout icon={Mail} title="Reset password" subtitle="We'll send you a link to reset it">
+      {sent ? (
+        <p className="text-center text-sm text-foreground">If an account exists with that email, you'll receive a password reset link shortly.</p>
+      ) : (
+        <form onSubmit={submit} className="space-y-4">
+          <div className="space-y-2">
+            <Label htmlFor="forgot-email">Email address</Label>
+            <div className="relative">
+              <Mail className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+              <Input id="forgot-email" type="email" autoComplete="email" autoFocus placeholder="you@example.com" value={email} onChange={(e) => setEmail(e.target.value)} className="h-12 pl-10" required />
+            </div>
+          </div>
+          <SubmitButton busy={busy} busyLabel="Sending...">
+            Send reset link
+          </SubmitButton>
+        </form>
+      )}
+      <p className="mt-6 text-center text-sm text-muted-foreground">
+        <AuthLink to="/login" returnTo={returnTo}>
+          <ArrowLeft className="mr-1 inline h-3 w-3" aria-hidden="true" />
+          Back to log in
+        </AuthLink>
+      </p>
+    </AuthLayout>
+  );
+}
+export function GoogleIcon({ className = "h-5 w-5" }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4" />
+      <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853" />
+      <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05" />
+      <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335" />
+    </svg>
+  );
+}
+import { Lock, LogIn, Mail } from "lucide-react";
+import { useState } from "react";
+import { AuthLayout } from "@/components/auth/AuthLayout";
+import { AuthError, AuthLink, GoogleButton, OrDivider, SubmitButton } from "@/components/auth/parts";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { MfaFlow } from "@/components/auth/MfaFlow";
+import { MfaScreen } from "@/components/auth/MfaParts";
+import { loginWithMfa } from "@/lib/authMfa";
+import { safeReturnTo } from "@/lib/authReturnTo";
+
+// The /login page. ?returnTo= (or the platform's ?from_url=) is where the visitor
+// goes after signing in — the login gate and the MCP consent page send people here with it.
+export function LoginPage() {
+  const returnTo = safeReturnTo();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [mfaChallenge, setMfaChallenge] = useState(null);
+
+  async function submit(e) {
+    e.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      const result = await loginWithMfa(email, password);
+      if (result.mfa_required) {
+        setMfaChallenge(result);
+        return;
+      }
+      // A hard redirect: the app re-initializes with the new session.
+      window.location.href = returnTo;
+    } catch (err) {
+      setError(err.message || "Invalid email or password");
+      setBusy(false);
+    }
+  }
+
+  // The second sign-in step (authenticator app or text message) replaces the whole page.
+  if (mfaChallenge) return <MfaScreen><MfaFlow challenge={mfaChallenge} returnTo={returnTo} /></MfaScreen>;
+
+  return (
+    <AuthLayout icon={LogIn} title="Welcome back" subtitle="Log in to your account">
+      <GoogleButton returnTo={returnTo} onError={setError} />
+      <OrDivider />
+      <AuthError>{error}</AuthError>
+      <form onSubmit={submit} className="space-y-4">
+        <div className="space-y-2">
+          <Label htmlFor="login-email">Email</Label>
+          <div className="relative">
+            <Mail className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+            <Input id="login-email" type="email" autoComplete="email" autoFocus placeholder="you@example.com" value={email} onChange={(e) => setEmail(e.target.value)} className="h-12 pl-10" required />
+          </div>
+        </div>
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <Label htmlFor="login-password">Password</Label>
+            <AuthLink to="/forgot-password" returnTo={returnTo} className="text-xs text-primary hover:underline">
+              Forgot password?
+            </AuthLink>
+          </div>
+          <div className="relative">
+            <Lock className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+            <Input id="login-password" type="password" autoComplete="current-password" placeholder="••••••••" value={password} onChange={(e) => setPassword(e.target.value)} className="h-12 pl-10" required />
+          </div>
+        </div>
+        <SubmitButton busy={busy} busyLabel="Logging in...">
+          Log in
+        </SubmitButton>
+      </form>
+      <p className="mt-6 text-center text-sm text-muted-foreground">
+        Don't have an account?{" "}
+        <AuthLink to="/register" returnTo={returnTo}>
+          Create one
+        </AuthLink>
+      </p>
+    </AuthLayout>
+  );
+}
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Loader2 } from "lucide-react";
+import { MfaMethodSetup } from "@/components/auth/MfaMethodSetup";
+import { CodeField, MfaHeader, MfaNotice, RememberDevice, ResendLine, useAppInfo, useCooldown } from "@/components/auth/MfaParts";
+import { finishSignIn, mfaSession } from "@/lib/authMfaFlow";
+
+const SMS_RESEND_SECONDS = 60;
+
+// The second sign-in step, for a sign-in that returned mfa_required. It is card content: a page
+// shows it with `return <MfaScreen><MfaFlow ... /></MfaScreen>` in place of its own layout.
+// session-record-block keeps the QR code, setup key and codes out of session recordings.
+// onManage(session) is called instead of finishing when the sign-in was for managing factors.
+export function MfaFlow({ challenge, returnTo, onManage }) {
+  const session = useMemo(() => mfaSession(challenge), [challenge]);
+  const finish = (result) => (result.mfa_management_token && onManage ? onManage(session) : finishSignIn(result.access_token, returnTo));
+  return (
+    <div className="session-record-block">
+      {challenge.next_step === "enroll"
+        ? <Enroll session={session} onDone={finish} />
+        : <Verify session={session} challenge={challenge} returnTo={returnTo} onDone={finish} />}
+    </div>
+  );
+}
+
+function Enroll({ session, onDone }) {
+  const [method, setMethod] = useState(null);
+  const info = useAppInfo();
+  return (
+    <>
+      <MfaHeader
+        title={info && `${info.name || "This app"} requires multi-factor authentication`}
+        description={method ? null : "Add a second sign-in step to keep your account secure. Choose how you want to get your codes."}
+      />
+      {method ? (
+        <MfaMethodSetup session={session} method={method} onDone={onDone} onBack={() => setMethod(null)} />
+      ) : (
+        <div className="space-y-3">
+          <Button className="w-full h-12 font-medium" onClick={() => setMethod("totp")}>Set up your authenticator app</Button>
+          <Button variant="outline" className="w-full h-12 font-medium" onClick={() => setMethod("sms")}>Enter your phone number</Button>
+        </div>
+      )}
+    </>
+  );
+}
+
+function Verify({ session, challenge, returnTo, onDone }) {
+  const methods = challenge.mfa_methods;
+  const [method, setMethod] = useState(methods.includes("totp") ? "totp" : "sms");
+  const [code, setCode] = useState("");
+  const [remember, setRemember] = useState(true);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [cooldown, setCooldown] = useCooldown();
+  const sent = useRef(false);
+  const phone = challenge.phone_hint || "your phone";
+
+  const sendCode = async () => {
+    setError(null);
+    setSending(true);
+    try {
+      await session.sendSignInCode();
+      setCooldown(SMS_RESEND_SECONDS);
+    } catch (err) {
+      setError(err);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  useEffect(() => {
+    // Text the code once when SMS is the method in use; resending is the user's call.
+    if (method !== "sms" || sent.current) return;
+    sent.current = true;
+    sendCode();
+  }, [method]);
+
+  const verify = async (value = code) => {
+    if (busy || value.length < 6) return;
+    setError(null);
+    setBusy(true);
+    try {
+      onDone(await session.verify(value, method, remember));
+    } catch (err) {
+      setError(err);
+      setCode("");
+      setBusy(false);
+    }
+  };
+
+  const other = methods.find((value) => value !== method);
+  return (
+    <>
+      <MfaHeader title="Verify your identity" />
+      <div className="space-y-4">
+        <MfaNotice error={error} />
+        <p className="text-sm text-muted-foreground text-center">
+          {method === "totp" ? "Enter the code from your authenticator app"
+            : sending && !cooldown ? `Sending code to ${phone}…` : `Enter the code sent to ${phone}`}
+        </p>
+        <CodeField id="mfa-code" value={code} onChange={setCode} onComplete={verify} />
+        <RememberDevice checked={remember} onChange={setRemember} />
+        <Button className="w-full h-12 font-medium" disabled={busy || code.length < 6} onClick={() => verify()}>
+          {busy && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+          {busy ? "Verifying..." : "Verify"}
+        </Button>
+        {method === "sms" && <ResendLine cooldown={cooldown} disabled={sending} onResend={sendCode} />}
+        {other && (
+          <Button variant="outline" className="w-full" onClick={() => { setMethod(other); setCode(""); setError(null); }}>
+            {other === "sms" ? "Verify via Text Message" : "Verify via Authenticator App"}
+          </Button>
+        )}
+        <div className="text-center">
+          <a href={returnTo && returnTo !== "/" ? "/login?returnTo=" + encodeURIComponent(returnTo) : "/login"} className="text-sm text-muted-foreground hover:underline">Back to Login</a>
+        </div>
+      </div>
+    </>
+  );
+}
+import { useEffect, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Loader2, Smartphone, MessageSquare } from "lucide-react";
+import { MfaMethodSetup } from "@/components/auth/MfaMethodSetup";
+import { CodeField, MfaHeader, MfaNotice, ResendLine, useCooldown } from "@/components/auth/MfaParts";
+
+const METHODS = [
+  { id: "totp", name: "Authenticator app", icon: Smartphone,
+    description: "Use an app like Google Authenticator or Duo to generate secure sign-in codes." },
+  { id: "sms", name: "Text messages", icon: MessageSquare, description: "Get sign-in codes sent to your phone by text message." },
+];
+const SMS_RESEND_SECONDS = 30;
+
+// Two-factor authentication settings: enable, replace or disable a method. Card content, shown
+// with <MfaScreen>. session is the mfaSession that just verified a management sign-in; its grant
+// lasts a few minutes, so an expired one sends the user back through /mfa.
+// The helper also offers session.forgetDevices(code, method) for a "forget remembered devices" control.
+export function MfaManage({ session, returnTo }) {
+  const [status, setStatus] = useState(null);
+  const [view, setView] = useState({ name: "list" });
+  const [error, setError] = useState(null);
+
+  const load = async () => {
+    setError(null);
+    try {
+      setStatus(await session.status());
+    } catch (err) {
+      setError(err);
+    }
+  };
+  useEffect(() => { load(); }, [session]);
+
+  const back = () => { setView({ name: "list" }); load(); };
+
+  return (
+    <div className="session-record-block">
+      <MfaHeader title="Two-factor authentication"
+        description="Add an extra layer of protection when signing in. You'll be asked for a code each time you sign in." />
+      {view.name === "setup" && <MfaMethodSetup session={session} method={view.method} signInPath="/mfa" onDone={back} onBack={() => setView({ name: "list" })} />}
+      {view.name === "disable" && <Disable session={session} method={view.method} onDone={back} onBack={() => setView({ name: "list" })} />}
+      {view.name === "list" && (
+        <div className="space-y-4">
+          <MfaNotice error={error} signInPath="/mfa" />
+          {!status && !error && <Loader2 className="mx-auto w-6 h-6 animate-spin text-muted-foreground" />}
+          {status && METHODS.map(({ id, name, icon: Icon, description }) => {
+            const enrolled = status.methods.includes(id);
+            return (
+              <div key={id} className="flex flex-wrap items-center gap-3 rounded-lg border border-border p-4">
+                <Icon className="w-5 h-5 text-muted-foreground shrink-0" aria-hidden="true" />
+                <div className="flex-1 min-w-[10rem]">
+                  <p className="font-medium">{name}</p>
+                  <p className="text-sm text-muted-foreground">
+                    {enrolled ? (id === "sms" && status.phone_hint ? `Enabled · ${status.phone_hint}` : "Enabled") : description}
+                  </p>
+                </div>
+                {/* On a narrow screen the actions drop below the method instead of squeezing it. */}
+                <div className="flex gap-2 ml-auto">
+                  <Button size="sm" variant="outline" onClick={() => setView({ name: "setup", method: id })}>
+                    {enrolled ? "Replace" : "Enable"}
+                  </Button>
+                  {enrolled && (
+                    <Button size="sm" variant="ghost" onClick={() => setView({ name: "disable", method: id })}>
+                      Disable
+                    </Button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          <Button className="w-full h-12 font-medium" onClick={() => { window.location.href = returnTo; }}>
+            Done
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Disables a method after a fresh code from that same method.
+function Disable({ session, method, onDone, onBack }) {
+  const [code, setCode] = useState("");
+  const [codeSent, setCodeSent] = useState(method === "totp");
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [cooldown, setCooldown] = useCooldown();
+
+  const run = async (task) => {
+    setError(null);
+    setBusy(true);
+    try {
+      return await task();
+    } catch (err) {
+      setError(err);
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const sendCode = async () => {
+    if (await run(() => session.sendProofCode())) {
+      setCodeSent(true);
+      setCooldown(SMS_RESEND_SECONDS);
+    }
+  };
+
+  const confirm = async (value = code) => {
+    if (busy || value.length < 6) return;
+    if (await run(() => session.removeMethod(method, value, method))) onDone();
+    else setCode("");
+  };
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-lg font-semibold text-center">
+        {method === "totp" ? "Enter a code from your authenticator app" : "Verify with a code sent to your phone"}
+      </h2>
+      <MfaNotice error={error} signInPath="/mfa" />
+      {codeSent ? (
+        <>
+          <CodeField id="mfa-disable-code" value={code} onChange={setCode} onComplete={confirm} />
+          {method === "sms" && <ResendLine cooldown={cooldown} disabled={busy} onResend={sendCode} />}
+        </>
+      ) : (
+        <Button className="w-full h-11" disabled={busy} onClick={sendCode}>
+          {busy && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+          Send Code
+        </Button>
+      )}
+      <div className="grid grid-cols-2 gap-3 pt-2">
+        <Button variant="outline" className="h-11" disabled={busy} onClick={onBack}>Cancel</Button>
+        <Button className="h-11" disabled={busy || !codeSent || code.length < 6} onClick={() => confirm()}>
+          {busy && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+          Verify & Disable
+        </Button>
+      </div>
+    </div>
+  );
+}
+import { useEffect, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
+import { Loader2 } from "lucide-react";
+import {
+  CodeField, CopyKeyButton, INVALID_PHONE, MfaNotice, PhoneField, ResendLine,
+  defaultDialCode, isPlausiblePhone, isTouchDevice, useCooldown,
+} from "@/components/auth/MfaParts";
+
+const SMS_RESEND_SECONDS = 30;
+const FULL_CODE = "Enter the full 6-digit code";
+
+// Sets up one method: method is "totp" (authenticator app) or "sms" (text messages).
+// onDone receives the server's result once the code is confirmed; onBack leaves the setup.
+export function MfaMethodSetup({ session, method, onDone, onBack, signInPath }) {
+  const [setup, setSetup] = useState(null);
+  const [step, setStep] = useState("start");
+  const [countryCode, setCountryCode] = useState(defaultDialCode);
+  const [phoneNumber, setPhoneNumber] = useState("");
+  const [code, setCode] = useState("");
+  const [fieldError, setFieldError] = useState(null);
+  const [error, setError] = useState(null);
+  const [resendError, setResendError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [cooldown, setCooldown] = useCooldown();
+  const started = useRef(false);
+  const fullPhone = `${countryCode}${phoneNumber}`;
+
+  // Runs a request with the buttons held; a failure goes to onError and the result is null.
+  const run = async (action, onError) => {
+    setBusy(true);
+    try {
+      return await action();
+    } catch (err) {
+      onError(err);
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    // Each setup call issues a new secret, so start it once.
+    if (method !== "totp" || started.current) return;
+    started.current = true;
+    run(() => session.setupAuthenticator(), setError).then((result) => result && setSetup(result));
+  }, [method, session]);
+
+  // A number that can't be real never reaches the server. A server rejection that names the phone shows
+  // as the same field error; anything else shows under the field as it is.
+  const sendCode = async () => {
+    setFieldError(null);
+    setError(null);
+    setResendError(null);
+    if (!isPlausiblePhone(fullPhone)) {
+      setFieldError(INVALID_PHONE);
+      return;
+    }
+    const sent = await run(() => session.sendPhoneCode(fullPhone), (err) => {
+      if (err.message?.toLowerCase().includes("phone")) setFieldError(INVALID_PHONE);
+      else setError(err);
+    });
+    if (sent) {
+      setStep("code");
+      setCode("");
+      setCooldown(SMS_RESEND_SECONDS);
+    }
+  };
+
+  const resend = async () => {
+    if (cooldown > 0) return;
+    setResendError(null);
+    try {
+      await session.sendPhoneCode(fullPhone);
+      setCooldown(SMS_RESEND_SECONDS);
+    } catch (err) {
+      setResendError(err.message || "Failed to resend");
+    }
+  };
+
+  // An incomplete code is flagged without a request. A wrong one keeps the digits and says so under them.
+  const confirm = async (value = code) => {
+    if (busy) return;
+    if (value.length !== 6) {
+      setFieldError(FULL_CODE);
+      return;
+    }
+    setFieldError(null);
+    setError(null);
+    const result = await run(
+      () => (method === "totp" ? session.confirmAuthenticator(value) : session.confirmPhone(value)),
+      (err) => (err.mustSignInAgain ? setError(err) : setFieldError(err.message || "Invalid code")),
+    );
+    if (result) onDone(result);
+  };
+
+  const backToStart = () => {
+    setStep("start");
+    setCode("");
+    setFieldError(null);
+    setError(null);
+    setResendError(null);
+  };
+
+  const actions = (secondary, onSecondary, primary, onPrimary, disabled = false) => (
+    <div className="grid grid-cols-2 gap-3 pt-2">
+      <Button variant="outline" className="h-11" disabled={busy} onClick={onSecondary}>{secondary}</Button>
+      <Button className="h-11" disabled={busy || disabled} onClick={onPrimary}>
+        {busy && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+        {primary}
+      </Button>
+    </div>
+  );
+
+  if (method === "totp" && step === "start") {
+    return (
+      <div className="space-y-4">
+        <h2 className="text-lg font-semibold text-center">Set up your authenticator app</h2>
+        <MfaNotice error={error} signInPath={signInPath} />
+        {!setup && !error && <Loader2 className="mx-auto w-6 h-6 animate-spin text-muted-foreground" />}
+        {setup && (isTouchDevice() ? (
+          <div className="space-y-3 text-sm">
+            <ol className="list-decimal pl-5 space-y-1 text-muted-foreground">
+              <li>Copy the key below.</li>
+              <li>In your authenticator app, add an account and paste the key.</li>
+              <li>Come back here and enter the code the app shows.</li>
+            </ol>
+            <code className="block rounded-lg border border-border px-3 py-3 text-center font-mono font-medium tracking-wider break-all">
+              {setup.secret_formatted}
+            </code>
+            <CopyKeyButton text={setup.secret_formatted} wide />
+          </div>
+        ) : (
+          <div className="flex flex-col items-center gap-2 text-sm">
+            <p className="font-medium">Scan the QR code with your authenticator app</p>
+            <img src={setup.qr_code} alt="QR code for authenticator app setup" className="w-36 h-36 rounded-lg border border-border bg-white p-1" />
+            <p className="text-muted-foreground mt-3">Can't scan the code? Enter it manually:</p>
+            <div className="flex flex-wrap items-center justify-center gap-1">
+              <code className="font-mono font-medium tracking-wider break-all">{setup.secret_formatted}</code>
+              <CopyKeyButton text={setup.secret_formatted} />
+            </div>
+          </div>
+        ))}
+        {actions("Cancel", onBack, "Continue", () => setStep("code"), !setup)}
+      </div>
+    );
+  }
+
+  if (method === "sms" && step === "start") {
+    const phoneError = fieldError ?? (error && !error.mustSignInAgain ? error.message : null);
+    return (
+      <div className="space-y-4">
+        <h2 className="text-lg font-semibold text-center">Enter your phone number</h2>
+        <p className="text-sm text-muted-foreground text-center">A verification code will be sent to this number to confirm it's yours.</p>
+        <div className="space-y-1.5">
+          <Label htmlFor="mfa-phone">Phone number</Label>
+          <PhoneField
+            countryCode={countryCode} onCountryCodeChange={setCountryCode}
+            phoneNumber={phoneNumber} onPhoneNumberChange={(value) => { setPhoneNumber(value); setFieldError(null); }}
+            error={phoneError} onSubmit={!busy && phoneNumber.length >= 4 ? sendCode : undefined}
+          />
+        </div>
+        {error?.mustSignInAgain && <MfaNotice error={error} signInPath={signInPath} />}
+        {actions("Cancel", onBack, "Send Code", sendCode, phoneNumber.length < 4)}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-lg font-semibold text-center">
+        {method === "totp" ? "Enter a code from your authenticator app" : "Verify your phone number"}
+      </h2>
+      {method === "sms" && <p className="text-sm text-muted-foreground text-center">A 6-digit code sent to {countryCode} {phoneNumber}</p>}
+      <div className="flex flex-col items-center gap-2">
+        <CodeField id="mfa-setup-code" value={code} onChange={(value) => { setCode(value); setFieldError(null); }}
+          onComplete={confirm} hasError={Boolean(fieldError)} />
+        {fieldError && <p className="text-sm text-destructive">{fieldError}</p>}
+        {method === "totp"
+          ? <p className="text-xs text-muted-foreground">Codes refresh every 30 seconds.</p>
+          : <ResendLine cooldown={cooldown} onResend={resend} error={resendError} />}
+      </div>
+      <MfaNotice error={error} signInPath={signInPath} />
+      {actions("Back", backToStart, "Verify", () => confirm())}
+    </div>
+  );
+}
+import { useEffect, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Loader2, Lock, Mail } from "lucide-react";
+import { GoogleIcon } from "@/components/auth/GoogleIcon";
+import { MfaFlow } from "@/components/auth/MfaFlow";
+import { MfaManage } from "@/components/auth/MfaManage";
+import { MfaHeader, MfaNotice, MfaScreen, useAppInfo } from "@/components/auth/MfaParts";
+import { finishSignIn, resumeMfa, signInToManageMfa, signInWithProvider } from "@/lib/authMfaFlow";
+import { safeReturnTo } from "@/lib/authReturnTo";
+
+const PROVIDERS = [
+  { id: "google", flag: "enable_google_login", name: "Google" },
+  { id: "microsoft", flag: "enable_microsoft_login", name: "Microsoft" },
+  { id: "facebook", flag: "enable_facebook_login", name: "Facebook" },
+  { id: "apple", flag: "enable_apple_login", name: "Apple" },
+];
+
+// The /mfa page: finishes a Google, Microsoft, Facebook, Apple or SSO sign-in that needs a second step
+// (?mfa_code=…), and opened directly it is the two-factor authentication settings page.
+export function MfaPage() {
+  const returnTo = safeReturnTo();
+  const [challenge, setChallenge] = useState(null);
+  const [managing, setManaging] = useState(null);
+  const [resuming, setResuming] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    resumeMfa()
+      .then((result) => {
+        // A remembered device signs in straight away; otherwise continue the second step here.
+        if (result?.access_token) return finishSignIn(result.access_token, returnTo);
+        if (result) setChallenge(result);
+        setResuming(false);
+      })
+      .catch((err) => { setError(err); setResuming(false); });
+  }, []);
+
+  if (resuming) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+  return (
+    <MfaScreen>
+      {managing ? <MfaManage session={managing} returnTo={returnTo} />
+        : challenge ? <MfaFlow challenge={challenge} returnTo={returnTo} onManage={setManaging} />
+        : <ConfirmIdentity returnTo={returnTo} onChallenge={setChallenge} initialError={error} />}
+    </MfaScreen>
+  );
+}
+
+// Changing two-factor settings starts with a fresh sign-in, then a code from an enrolled method.
+function ConfirmIdentity({ returnTo, onChallenge, initialError }) {
+  const info = useAppInfo();
+  const options = info ? info.auth_config || {} : null;
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState(initialError);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(null);
+    setBusy(true);
+    try {
+      onChallenge(await signInToManageMfa(email, password));
+    } catch (err) {
+      setError(err);
+      setBusy(false);
+    }
+  };
+
+  const withProvider = (provider) => signInWithProvider(provider, returnTo, { manage: true }).catch(setError);
+  const providers = options ? PROVIDERS.filter((provider) => options[provider.flag] ?? provider.id === "google") : [];
+
+  return (
+    <>
+      <MfaHeader title={info && `Welcome to ${info.name || "the app"}`} description="Sign in to continue" />
+      <MfaNotice error={error} />
+      {!options && !error && <Loader2 className="mx-auto w-6 h-6 animate-spin text-muted-foreground" />}
+      {options && (
+        <div className="space-y-4">
+          {providers.map((provider) => (
+            <Button key={provider.id} variant="outline" className="w-full h-12 text-sm font-medium" onClick={() => withProvider(provider.id)}>
+              {provider.id === "google" && <GoogleIcon className="w-5 h-5 mr-2" />}
+              Continue with {provider.name}
+            </Button>
+          ))}
+          {(options.enable_sso_login || options.use_workspace_sso) && (
+            <Button variant="outline" className="w-full h-12 text-sm font-medium" onClick={() => withProvider("sso")}>
+              Continue with SSO
+            </Button>
+          )}
+          {options.enable_username_password && (
+            <form onSubmit={submit} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="mfa-email">Email</Label>
+                <div className="relative">
+                  <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" aria-hidden="true" />
+                  <Input id="mfa-email" type="email" autoComplete="email" placeholder="you@example.com" value={email}
+                    onChange={(e) => setEmail(e.target.value)} className="pl-10 h-12" required />
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="mfa-password">Password</Label>
+                <div className="relative">
+                  <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" aria-hidden="true" />
+                  <Input id="mfa-password" type="password" autoComplete="current-password" placeholder="••••••••" value={password}
+                    onChange={(e) => setPassword(e.target.value)} className="pl-10 h-12" required />
+                </div>
+              </div>
+              <Button type="submit" className="w-full h-12 font-medium" disabled={busy}>
+                {busy && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+                Continue
+              </Button>
+            </form>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+import { useEffect, useRef, useState } from "react";
+import { Check, ChevronsUpDown, Copy, ShieldCheck } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
+import { Input } from "@/components/ui/input";
+import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
+import { Label } from "@/components/ui/label";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { cn } from "@/lib/utils";
+import { loadSignInOptions } from "@/lib/authMfaFlow";
+import { safeReturnTo } from "@/lib/authReturnTo";
+
+// Building blocks shared by MfaFlow, MfaMethodSetup and MfaManage.
+
+let appInfo;
+
+// The app's name and sign-in settings, as login-info reports them.
+export function useAppInfo() {
+  const [info, setInfo] = useState(null);
+  useEffect(() => {
+    appInfo ||= loadSignInOptions().catch(() => ({}));
+    appInfo.then((value) => setInfo(value || {}));
+  }, []);
+  return info;
+}
+
+// A whole page holding one MFA card. MfaFlow and MfaManage are card content, so a page that
+// shows them returns <MfaScreen> in place of its own layout instead of nesting them in its card.
+export function MfaScreen({ children }) {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-background px-4 py-8">
+      <div className="w-full max-w-md bg-card rounded-2xl shadow-sm border border-border p-8">{children}</div>
+    </div>
+  );
+}
+
+// An icon, a title and a description, then the step's controls. A title that waits for the app's
+// name is null until it loads, so the right text appears once instead of replacing a placeholder.
+export function MfaHeader({ title, description }) {
+  return (
+    <div className="flex flex-col items-center text-center mb-6">
+      <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-primary mb-4">
+        <ShieldCheck className="w-7 h-7 text-primary-foreground" aria-hidden="true" />
+      </div>
+      <h1 className="text-2xl font-bold tracking-tight text-foreground min-h-[2rem]">{title}</h1>
+      {description && <p className="text-muted-foreground mt-2">{description}</p>}
+    </div>
+  );
+}
+
+// Six digits. Like the built-in code box, any change that leaves six digits, a paste over a full code
+// included, and the Enter key both call onComplete with the code as it stands.
+export function CodeField({ id, label = "Enter the 6-digit code", value, onChange, onComplete, hasError = false }) {
+  return (
+    <div className="space-y-2">
+      <Label htmlFor={id} className="block text-center font-normal text-muted-foreground">{label}</Label>
+      <InputOTP id={id} maxLength={6} value={value} autoFocus autoComplete="one-time-code" containerClassName="justify-center"
+        onChange={(next) => { onChange(next); if (next.length === 6) onComplete?.(next); }}
+        onKeyDown={(e) => { if (e.key === "Enter" && onComplete) { e.preventDefault(); onComplete(value); } }}>
+        <InputOTPGroup>
+          {[0, 1, 2, 3, 4, 5].map((index) => (
+            <InputOTPSlot key={index} index={index} className={hasError ? "border-destructive" : undefined} />
+          ))}
+        </InputOTPGroup>
+      </InputOTP>
+    </div>
+  );
+}
+
+// "Didn't receive a code? Resend", counting down while a resend isn't allowed yet.
+export function ResendLine({ cooldown, disabled, onResend, error }) {
+  return (
+    <div className="space-y-1 text-center">
+      <p className="text-sm text-muted-foreground">
+        Didn't receive a code?{" "}
+        {cooldown > 0 ? (
+          <span>Resend in {cooldown}s</span>
+        ) : (
+          <button type="button" disabled={disabled} onClick={onResend} className="font-semibold text-foreground hover:underline disabled:opacity-50">
+            Resend
+          </button>
+        )}
+      </p>
+      {error && <p className="text-sm text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+// ---- Phone number entry: the built-in screen's country picker and checks, without a phone-number library.
+
+export const INVALID_PHONE = "Invalid phone number. Please check the number and try again.";
+
+// Dial code of every country (iso2 + digits), from country-telephone-data, which the built-in picker lists.
+const COUNTRY_DIAL_CODES = new Map(
+  "af93 ax358 al355 dz213 as1684 ad376 ao244 ai1264 aq672 ag1268 ar54 am374 aw297 au61 at43 az994 bs1242 bh973 bd880 bb1246 by375 be32 bz501 bj229 bm1441 bt975 bo591 ba387 bw267 bv47 br55 io246 vg1284 bn673 bg359 bf226 bi257 kh855 cm237 ca1 cv238 bq599 ky1345 cf236 td235 cl56 cn86 cx61 cc61 co57 km269 cd243 cg242 ck682 cr506 ci225 hr385 cu53 cw599 cy357 cz420 dk45 dj253 dm1767 do1 ec593 eg20 sv503 gq240 er291 ee372 et251 fk500 fo298 fj679 fi358 fr33 gf594 pf689 tf262 ga241 gm220 ge995 de49 gh233 gi350 gr30 gl299 gd1473 gp590 gu1671 gt502 gg44 gn224 gw245 gy592 ht509 hm672 hn504 hk852 hu36 is354 in91 id62 ir98 iq964 ie353 im44 il972 it39 jm1876 jp81 je44 jo962 kz7 ke254 ki686 xk383 kw965 kg996 la856 lv371 lb961 ls266 lr231 ly218 li423 lt370 lu352 mo853 mk389 mg261 mw265 my60 mv960 ml223 mt356 mh692 mq596 mr222 mu230 yt262 mx52 fm691 md373 mc377 mn976 me382 ms1664 ma212 mz258 mm95 na264 nr674 np977 nl31 nc687 nz64 ni505 ne227 ng234 nu683 nf672 kp850 mp1670 no47 om968 pk92 pw680 ps970 pa507 pg675 py595 pe51 ph63 pn64 pl48 pt351 pr1 qa974 re262 ro40 ru7 rw250 bl590 sh290 kn1869 lc1758 mf590 pm508 vc1784 ws685 sm378 st239 sa966 sn221 rs381 sc248 sl232 sg65 sx1721 sk421 si386 sb677 so252 za27 gs500 kr82 ss211 es34 lk94 sd249 sr597 sj47 sz268 se46 ch41 sy963 tw886 tj992 tz255 th66 tl670 tg228 tk690 to676 tt1868 tn216 tr90 tm993 tc1649 tv688 vi1340 ug256 ua380 ae971 gb44 us1 um1 uy598 uz998 vu678 va39 ve58 vn84 wf681 eh212 ye967 zm260 zw263".split(" ").map((entry) => [entry.slice(0, 2), entry.slice(2)]),
+);
+const DIAL_CODES = [...new Set(COUNTRY_DIAL_CODES.values())].sort((a, b) => Number(a) - Number(b));
+
+// The dial code of the browser's region (en-DE → +49), else +1.
+export function defaultDialCode() {
+  const region = typeof navigator === "undefined" ? undefined : navigator.language.split("-")[1]?.toLowerCase();
+  const dialCode = region && COUNTRY_DIAL_CODES.get(region);
+  return dialCode ? `+${dialCode}` : "+1";
+}
+
+// The built-in screen asks libphonenumber whether the number is valid for its country. Here only the
+// length E.164 allows is checked (the shortest real numbers have 7 digits in all, the longest 15); the
+// server runs the full per-country check before any text is sent, and answers with the same message.
+export function isPlausiblePhone(fullPhone) {
+  const digits = fullPhone.replace(/\D/g, "");
+  return digits.length >= 7 && digits.length <= 15;
+}
+
+const matchesSearch = (code, search) => {
+  const normalized = search.replace(/\+/g, "");
+  return normalized === "" || code.startsWith(normalized);
+};
+
+// A searchable list of dial codes. Typing narrows it, and closing it with one match left picks that one.
+function DialCodePicker({ value, onChange }) {
+  const [open, setOpen] = useState(false);
+  const search = useRef("");
+
+  const handleOpenChange = (next) => {
+    if (!next && search.current) {
+      const matches = DIAL_CODES.filter((code) => matchesSearch(code, search.current));
+      if (matches.length === 1) onChange(`+${matches[0]}`);
+      search.current = "";
+    }
+    setOpen(next);
+  };
+
+  return (
+    <Popover open={open} onOpenChange={handleOpenChange} modal>
+      <PopoverTrigger asChild>
+        <Button type="button" variant="outline" role="combobox" aria-expanded={open} aria-label="Country code"
+          className="h-10 w-[100px] justify-between px-2.5 font-normal shadow-none">
+          {value}
+          <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" aria-hidden="true" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[140px] p-0" align="start" side="bottom" avoidCollisions={false}>
+        <Command filter={(item, text) => (matchesSearch(item, text) ? 1 : 0)}>
+          <CommandInput placeholder="Search..." className="h-9" onValueChange={(text) => { search.current = text; }} />
+          <CommandList>
+            <CommandEmpty>No match</CommandEmpty>
+            <CommandGroup>
+              {DIAL_CODES.map((code) => (
+                <CommandItem key={code} value={code} onSelect={() => { onChange(`+${code}`); search.current = ""; setOpen(false); }}>
+                  +{code}
+                  <Check className={cn("ml-auto h-3.5 w-3.5", value === `+${code}` ? "opacity-100" : "opacity-0")} aria-hidden="true" />
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+// Dial code picker plus the number (digits only, 15 at most). Once 4 digits are in, a number that can't
+// be real is flagged as you type; `error` (from a failed send) takes the place of that message.
+export function PhoneField({ countryCode, onCountryCodeChange, phoneNumber, onPhoneNumberChange, error, onSubmit }) {
+  const [touched, setTouched] = useState(false);
+  const invalid = touched && phoneNumber.length >= 4 && !isPlausiblePhone(`${countryCode}${phoneNumber}`);
+  const message = error ?? (invalid ? INVALID_PHONE : null);
+  return (
+    <div className="space-y-1.5">
+      <div className="flex gap-2">
+        <DialCodePicker value={countryCode} onChange={onCountryCodeChange} />
+        <Input id="mfa-phone" type="tel" autoComplete="tel-national" autoFocus value={phoneNumber} maxLength={15}
+          placeholder="5551234567" aria-invalid={Boolean(message)}
+          onChange={(e) => { onPhoneNumberChange(e.target.value.replace(/\D/g, "")); setTouched(true); }}
+          onKeyDown={(e) => { if (e.key === "Enter" && onSubmit) { e.preventDefault(); onSubmit(); } }}
+          className={cn("h-10 flex-1", message && "border-destructive focus-visible:ring-destructive")} />
+      </div>
+      {message
+        ? <p className="text-sm text-destructive">{message}</p>
+        : <p className="text-sm text-muted-foreground">Standard message and data rates may apply.</p>}
+    </div>
+  );
+}
+
+// Copies the setup key: an icon next to the key, or with `wide` the full-width "Copy key" button used on phones.
+export function CopyKeyButton({ text, wide = false }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    await navigator.clipboard.writeText(text.replace(/\s/g, ""));
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+  if (wide) {
+    return (
+      <Button type="button" variant="outline" className="w-full h-11" onClick={copy}>
+        {copied ? "Copied" : "Copy key"}
+      </Button>
+    );
+  }
+  return (
+    <button type="button" onClick={copy} title="Copy to clipboard" aria-label="Copy to clipboard"
+      className="inline-flex items-center justify-center rounded-md p-2 text-muted-foreground hover:text-foreground hover:bg-muted">
+      {copied ? <Check className="w-4 h-4" aria-hidden="true" /> : <Copy className="w-4 h-4" aria-hidden="true" />}
+    </button>
+  );
+}
+
+// An expired or used-up challenge can't be retried: send the user back through sign-in
+// (signInPath "/mfa" for factor management, whose sign-in lives on that page). The server's
+// wording for that case already says "sign in again", so it is replaced, not repeated.
+export function MfaNotice({ error, signInPath = "/login" }) {
+  if (!error) return null;
+  const returnTo = safeReturnTo();
+  return (
+    <div role="alert" className="mb-4 p-3 rounded-lg bg-destructive/10 text-destructive text-sm text-center">
+      {error.mustSignInAgain ? (
+        <>
+          Your sign-in expired.{" "}
+          <a href={signInPath + (returnTo !== "/" ? "?returnTo=" + encodeURIComponent(returnTo) : "")} className="font-medium underline">
+            Sign in again
+          </a>
+        </>
+      ) : (error.message || "Verification failed. Please try again.")}
+    </div>
+  );
+}
+
+export function RememberDevice({ checked, onChange }) {
+  return (
+    <label className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
+      <input type="checkbox" className="h-4 w-4 accent-primary" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      Remember this device for 30 days
+    </label>
+  );
+}
+
+// Seconds left before another text message can be sent.
+export function useCooldown() {
+  const [left, setLeft] = useState(0);
+  useEffect(() => {
+    if (left <= 0) return undefined;
+    const timer = setTimeout(() => setLeft(left - 1), 1000);
+    return () => clearTimeout(timer);
+  }, [left]);
+  return [left, setLeft];
+}
+
+// Phones and tablets run the authenticator app on this device, so a QR code can't be scanned.
+export function isTouchDevice() {
+  return typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)").matches;
+}
+import { useEffect, useRef, useState } from "react";
+import { Check, ChevronsUpDown, Copy, ShieldCheck } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
+import { Input } from "@/components/ui/input";
+import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
+import { Label } from "@/components/ui/label";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { cn } from "@/lib/utils";
+import { loadSignInOptions } from "@/lib/authMfaFlow";
+import { safeReturnTo } from "@/lib/authReturnTo";
+
+// Building blocks shared by MfaFlow, MfaMethodSetup and MfaManage.
+
+let appInfo;
+
+// The app's name and sign-in settings, as login-info reports them.
+export function useAppInfo() {
+  const [info, setInfo] = useState(null);
+  useEffect(() => {
+    appInfo ||= loadSignInOptions().catch(() => ({}));
+    appInfo.then((value) => setInfo(value || {}));
+  }, []);
+  return info;
+}
+
+// A whole page holding one MFA card. MfaFlow and MfaManage are card content, so a page that
+// shows them returns <MfaScreen> in place of its own layout instead of nesting them in its card.
+export function MfaScreen({ children }) {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-background px-4 py-8">
+      <div className="w-full max-w-md bg-card rounded-2xl shadow-sm border border-border p-8">{children}</div>
+    </div>
+  );
+}
+
+// An icon, a title and a description, then the step's controls. A title that waits for the app's
+// name is null until it loads, so the right text appears once instead of replacing a placeholder.
+export function MfaHeader({ title, description }) {
+  return (
+    <div className="flex flex-col items-center text-center mb-6">
+      <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-primary mb-4">
+        <ShieldCheck className="w-7 h-7 text-primary-foreground" aria-hidden="true" />
+      </div>
+      <h1 className="text-2xl font-bold tracking-tight text-foreground min-h-[2rem]">{title}</h1>
+      {description && <p className="text-muted-foreground mt-2">{description}</p>}
+    </div>
+  );
+}
+
+// Six digits. Like the built-in code box, any change that leaves six digits, a paste over a full code
+// included, and the Enter key both call onComplete with the code as it stands.
+export function CodeField({ id, label = "Enter the 6-digit code", value, onChange, onComplete, hasError = false }) {
+  return (
+    <div className="space-y-2">
+      <Label htmlFor={id} className="block text-center font-normal text-muted-foreground">{label}</Label>
+      <InputOTP id={id} maxLength={6} value={value} autoFocus autoComplete="one-time-code" containerClassName="justify-center"
+        onChange={(next) => { onChange(next); if (next.length === 6) onComplete?.(next); }}
+        onKeyDown={(e) => { if (e.key === "Enter" && onComplete) { e.preventDefault(); onComplete(value); } }}>
+        <InputOTPGroup>
+          {[0, 1, 2, 3, 4, 5].map((index) => (
+            <InputOTPSlot key={index} index={index} className={hasError ? "border-destructive" : undefined} />
+          ))}
+        </InputOTPGroup>
+      </InputOTP>
+    </div>
+  );
+}
+
+// "Didn't receive a code? Resend", counting down while a resend isn't allowed yet.
+export function ResendLine({ cooldown, disabled, onResend, error }) {
+  return (
+    <div className="space-y-1 text-center">
+      <p className="text-sm text-muted-foreground">
+        Didn't receive a code?{" "}
+        {cooldown > 0 ? (
+          <span>Resend in {cooldown}s</span>
+        ) : (
+          <button type="button" disabled={disabled} onClick={onResend} className="font-semibold text-foreground hover:underline disabled:opacity-50">
+            Resend
+          </button>
+        )}
+      </p>
+      {error && <p className="text-sm text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+// ---- Phone number entry: the built-in screen's country picker and checks, without a phone-number library.
+
+export const INVALID_PHONE = "Invalid phone number. Please check the number and try again.";
+
+// Dial code of every country (iso2 + digits), from country-telephone-data, which the built-in picker lists.
+const COUNTRY_DIAL_CODES = new Map(
+  "af93 ax358 al355 dz213 as1684 ad376 ao244 ai1264 aq672 ag1268 ar54 am374 aw297 au61 at43 az994 bs1242 bh973 bd880 bb1246 by375 be32 bz501 bj229 bm1441 bt975 bo591 ba387 bw267 bv47 br55 io246 vg1284 bn673 bg359 bf226 bi257 kh855 cm237 ca1 cv238 bq599 ky1345 cf236 td235 cl56 cn86 cx61 cc61 co57 km269 cd243 cg242 ck682 cr506 ci225 hr385 cu53 cw599 cy357 cz420 dk45 dj253 dm1767 do1 ec593 eg20 sv503 gq240 er291 ee372 et251 fk500 fo298 fj679 fi358 fr33 gf594 pf689 tf262 ga241 gm220 ge995 de49 gh233 gi350 gr30 gl299 gd1473 gp590 gu1671 gt502 gg44 gn224 gw245 gy592 ht509 hm672 hn504 hk852 hu36 is354 in91 id62 ir98 iq964 ie353 im44 il972 it39 jm1876 jp81 je44 jo962 kz7 ke254 ki686 xk383 kw965 kg996 la856 lv371 lb961 ls266 lr231 ly218 li423 lt370 lu352 mo853 mk389 mg261 mw265 my60 mv960 ml223 mt356 mh692 mq596 mr222 mu230 yt262 mx52 fm691 md373 mc377 mn976 me382 ms1664 ma212 mz258 mm95 na264 nr674 np977 nl31 nc687 nz64 ni505 ne227 ng234 nu683 nf672 kp850 mp1670 no47 om968 pk92 pw680 ps970 pa507 pg675 py595 pe51 ph63 pn64 pl48 pt351 pr1 qa974 re262 ro40 ru7 rw250 bl590 sh290 kn1869 lc1758 mf590 pm508 vc1784 ws685 sm378 st239 sa966 sn221 rs381 sc248 sl232 sg65 sx1721 sk421 si386 sb677 so252 za27 gs500 kr82 ss211 es34 lk94 sd249 sr597 sj47 sz268 se46 ch41 sy963 tw886 tj992 tz255 th66 tl670 tg228 tk690 to676 tt1868 tn216 tr90 tm993 tc1649 tv688 vi1340 ug256 ua380 ae971 gb44 us1 um1 uy598 uz998 vu678 va39 ve58 vn84 wf681 eh212 ye967 zm260 zw263".split(" ").map((entry) => [entry.slice(0, 2), entry.slice(2)]),
+);
+const DIAL_CODES = [...new Set(COUNTRY_DIAL_CODES.values())].sort((a, b) => Number(a) - Number(b));
+
+// The dial code of the browser's region (en-DE → +49), else +1.
+export function defaultDialCode() {
+  const region = typeof navigator === "undefined" ? undefined : navigator.language.split("-")[1]?.toLowerCase();
+  const dialCode = region && COUNTRY_DIAL_CODES.get(region);
+  return dialCode ? `+${dialCode}` : "+1";
+}
+
+// The built-in screen asks libphonenumber whether the number is valid for its country. Here only the
+// length E.164 allows is checked (the shortest real numbers have 7 digits in all, the longest 15); the
+// server runs the full per-country check before any text is sent, and answers with the same message.
+export function isPlausiblePhone(fullPhone) {
+  const digits = fullPhone.replace(/\D/g, "");
+  return digits.length >= 7 && digits.length <= 15;
+}
+
+const matchesSearch = (code, search) => {
+  const normalized = search.replace(/\+/g, "");
+  return normalized === "" || code.startsWith(normalized);
+};
+
+// A searchable list of dial codes. Typing narrows it, and closing it with one match left picks that one.
+function DialCodePicker({ value, onChange }) {
+  const [open, setOpen] = useState(false);
+  const search = useRef("");
+
+  const handleOpenChange = (next) => {
+    if (!next && search.current) {
+      const matches = DIAL_CODES.filter((code) => matchesSearch(code, search.current));
+      if (matches.length === 1) onChange(`+${matches[0]}`);
+      search.current = "";
+    }
+    setOpen(next);
+  };
+
+  return (
+    <Popover open={open} onOpenChange={handleOpenChange} modal>
+      <PopoverTrigger asChild>
+        <Button type="button" variant="outline" role="combobox" aria-expanded={open} aria-label="Country code"
+          className="h-10 w-[100px] justify-between px-2.5 font-normal shadow-none">
+          {value}
+          <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" aria-hidden="true" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[140px] p-0" align="start" side="bottom" avoidCollisions={false}>
+        <Command filter={(item, text) => (matchesSearch(item, text) ? 1 : 0)}>
+          <CommandInput placeholder="Search..." className="h-9" onValueChange={(text) => { search.current = text; }} />
+          <CommandList>
+            <CommandEmpty>No match</CommandEmpty>
+            <CommandGroup>
+              {DIAL_CODES.map((code) => (
+                <CommandItem key={code} value={code} onSelect={() => { onChange(`+${code}`); search.current = ""; setOpen(false); }}>
+                  +{code}
+                  <Check className={cn("ml-auto h-3.5 w-3.5", value === `+${code}` ? "opacity-100" : "opacity-0")} aria-hidden="true" />
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+// Dial code picker plus the number (digits only, 15 at most). Once 4 digits are in, a number that can't
+// be real is flagged as you type; `error` (from a failed send) takes the place of that message.
+export function PhoneField({ countryCode, onCountryCodeChange, phoneNumber, onPhoneNumberChange, error, onSubmit }) {
+  const [touched, setTouched] = useState(false);
+  const invalid = touched && phoneNumber.length >= 4 && !isPlausiblePhone(`${countryCode}${phoneNumber}`);
+  const message = error ?? (invalid ? INVALID_PHONE : null);
+  return (
+    <div className="space-y-1.5">
+      <div className="flex gap-2">
+        <DialCodePicker value={countryCode} onChange={onCountryCodeChange} />
+        <Input id="mfa-phone" type="tel" autoComplete="tel-national" autoFocus value={phoneNumber} maxLength={15}
+          placeholder="5551234567" aria-invalid={Boolean(message)}
+          onChange={(e) => { onPhoneNumberChange(e.target.value.replace(/\D/g, "")); setTouched(true); }}
+          onKeyDown={(e) => { if (e.key === "Enter" && onSubmit) { e.preventDefault(); onSubmit(); } }}
+          className={cn("h-10 flex-1", message && "border-destructive focus-visible:ring-destructive")} />
+      </div>
+      {message
+        ? <p className="text-sm text-destructive">{message}</p>
+        : <p className="text-sm text-muted-foreground">Standard message and data rates may apply.</p>}
+    </div>
+  );
+}
+
+// Copies the setup key: an icon next to the key, or with `wide` the full-width "Copy key" button used on phones.
+export function CopyKeyButton({ text, wide = false }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    await navigator.clipboard.writeText(text.replace(/\s/g, ""));
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+  if (wide) {
+    return (
+      <Button type="button" variant="outline" className="w-full h-11" onClick={copy}>
+        {copied ? "Copied" : "Copy key"}
+      </Button>
+    );
+  }
+  return (
+    <button type="button" onClick={copy} title="Copy to clipboard" aria-label="Copy to clipboard"
+      className="inline-flex items-center justify-center rounded-md p-2 text-muted-foreground hover:text-foreground hover:bg-muted">
+      {copied ? <Check className="w-4 h-4" aria-hidden="true" /> : <Copy className="w-4 h-4" aria-hidden="true" />}
+    </button>
+  );
+}
+
+// An expired or used-up challenge can't be retried: send the user back through sign-in
+// (signInPath "/mfa" for factor management, whose sign-in lives on that page). The server's
+// wording for that case already says "sign in again", so it is replaced, not repeated.
+export function MfaNotice({ error, signInPath = "/login" }) {
+  if (!error) return null;
+  const returnTo = safeReturnTo();
+  return (
+    <div role="alert" className="mb-4 p-3 rounded-lg bg-destructive/10 text-destructive text-sm text-center">
+      {error.mustSignInAgain ? (
+        <>
+          Your sign-in expired.{" "}
+          <a href={signInPath + (returnTo !== "/" ? "?returnTo=" + encodeURIComponent(returnTo) : "")} className="font-medium underline">
+            Sign in again
+          </a>
+        </>
+      ) : (error.message || "Verification failed. Please try again.")}
+    </div>
+  );
+}
+
+export function RememberDevice({ checked, onChange }) {
+  return (
+    <label className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
+      <input type="checkbox" className="h-4 w-4 accent-primary" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      Remember this device for 30 days
+    </label>
+  );
+}
+
+// Seconds left before another text message can be sent.
+export function useCooldown() {
+  const [left, setLeft] = useState(0);
+  useEffect(() => {
+    if (left <= 0) return undefined;
+    const timer = setTimeout(() => setLeft(left - 1), 1000);
+    return () => clearTimeout(timer);
+  }, [left]);
+  return [left, setLeft];
+}
+
+// Phones and tablets run the authenticator app on this device, so a QR code can't be scanned.
+export function isTouchDevice() {
+  return typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)").matches;
+}
+import { Link } from "@tanstack/react-router";
+import { Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { GoogleIcon } from "./GoogleIcon";
+import { signInWithProvider } from "@/lib/authMfaFlow";
+import { returnToSearch } from "@/lib/authReturnTo";
+
+// Small pieces the auth pages share.
+
+export function AuthError({ children }) {
+  if (!children) return null;
+  return (
+    <div role="alert" className="mb-4 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
+      {children}
+    </div>
+  );
+}
+
+export function SubmitButton({ busy, busyLabel, children, ...props }) {
+  return (
+    <Button type="submit" className="h-12 w-full font-medium" disabled={busy} {...props}>
+      {busy ? (
+        <>
+          <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
+          {busyLabel}
+        </>
+      ) : (
+        children
+      )}
+    </Button>
+  );
+}
+
+export function GoogleButton({ returnTo, onError }) {
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      className="mb-6 h-12 w-full text-sm font-medium"
+      onClick={() => signInWithProvider("google", returnTo).catch((err) => onError(err.message || "Unable to sign in with Google"))}
+    >
+      <GoogleIcon className="mr-2 h-5 w-5" />
+      Continue with Google
+    </Button>
+  );
+}
+
+export function OrDivider() {
+  return (
+    <div className="relative mb-6">
+      <div className="absolute inset-0 flex items-center">
+        <div className="w-full border-t border-border" />
+      </div>
+      <div className="relative flex justify-center text-xs uppercase">
+        <span className="bg-card px-3 text-muted-foreground">or</span>
+      </div>
+    </div>
+  );
+}
+
+// A link between auth screens that carries the way back (?returnTo=) along.
+export function AuthLink({ to, returnTo, className = "font-medium text-primary hover:underline", children }) {
+  return (
+    <Link to={to} search={returnToSearch(returnTo)} className={className}>
+      {children}
+    </Link>
+  );
+}
+import { Lock, Mail, UserPlus } from "lucide-react";
+import { useState } from "react";
+import { toast } from "sonner";
+import { base44 } from "@/api/base44Client";
+import { AuthLayout } from "@/components/auth/AuthLayout";
+import { MfaFlow } from "@/components/auth/MfaFlow";
+import { MfaScreen } from "@/components/auth/MfaParts";
+import { AuthError, AuthLink, GoogleButton, OrDivider, SubmitButton } from "@/components/auth/parts";
+import { Input } from "@/components/ui/input";
+import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
+import { Label } from "@/components/ui/label";
+import { safeReturnTo } from "@/lib/authReturnTo";
+
+const isAlreadyVerified = (err) => err?.status === 400 && /already verified/i.test(err?.message ?? "");
+
+/**
+ * The /register page: register → OTP → verifyOtp → setToken. Registration alone
+ * does not sign the user in (the account is unverified), so the code step is never
+ * skipped and loginViaEmailPassword is never called right after register.
+ */
+export function RegisterPage() {
+  const returnTo = safeReturnTo();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [otpCode, setOtpCode] = useState("");
+  const [step, setStep] = useState("form");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [mfaChallenge, setMfaChallenge] = useState(null);
+
+  async function register(e) {
+    e.preventDefault();
+    setError("");
+    if (password !== confirm) {
+      setError("Passwords do not match");
+      return;
+    }
+    setBusy(true);
+    try {
+      await base44.auth.register({ email, password });
+      setStep("otp");
+    } catch (err) {
+      setError(err.message || "Registration failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function verify(e) {
+    e.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      const result = await base44.auth.verifyOtp({ email, otpCode });
+      if (result?.mfa_required) {
+        setMfaChallenge(result);
+        return;
+      }
+      if (result?.access_token) base44.auth.setToken(result.access_token);
+      window.location.href = returnTo;
+    } catch (err) {
+      // Verified server-side but the answer never arrived: the code is spent and
+      // there is no token, so the only way forward is a normal sign-in.
+      if (isAlreadyVerified(err)) setStep("already_verified");
+      else setError(err.message || "Invalid verification code");
+      setBusy(false);
+    }
+  }
+
+  async function resend() {
+    setError("");
+    try {
+      await base44.auth.resendOtp(email);
+      toast("Code sent", { description: "Check your email for the new code." });
+    } catch (err) {
+      if (isAlreadyVerified(err)) setStep("already_verified");
+      else setError(err.message || "Failed to resend code");
+    }
+  }
+
+  // The account is verified; the second sign-in step replaces the whole page and finishes signing in.
+  if (mfaChallenge) return <MfaScreen><MfaFlow challenge={mfaChallenge} returnTo={returnTo} /></MfaScreen>;
+
+  if (step === "already_verified") {
+    return (
+      <AuthLayout icon={UserPlus} title="Create your account" subtitle="Sign up to get started">
+        <p className="mb-4 text-sm text-muted-foreground">
+          <span className="font-medium text-foreground">{email}</span> is already verified. Sign in to continue.
+        </p>
+        <AuthLink to="/login" returnTo={returnTo} className="inline-flex h-12 w-full items-center justify-center rounded-md bg-primary text-sm font-medium text-primary-foreground hover:bg-primary/90">
+          Sign in
+        </AuthLink>
+      </AuthLayout>
+    );
+  }
+
+  if (step === "otp") {
+    return (
+      <AuthLayout icon={UserPlus} title="Create your account" subtitle="Sign up to get started">
+        <form onSubmit={verify}>
+          <p className="mb-4 text-sm text-muted-foreground">
+            We sent a 6-digit code to <span className="font-medium text-foreground">{email}</span>.
+          </p>
+          <AuthError>{error}</AuthError>
+          <div className="mb-6 flex justify-center">
+            <InputOTP maxLength={6} value={otpCode} onChange={setOtpCode} autoFocus autoComplete="one-time-code">
+              <InputOTPGroup>
+                {[0, 1, 2, 3, 4, 5].map((i) => (
+                  <InputOTPSlot key={i} index={i} />
+                ))}
+              </InputOTPGroup>
+            </InputOTP>
+          </div>
+          <SubmitButton busy={busy} busyLabel="Verifying..." disabled={busy || otpCode.length < 6}>
+            Verify
+          </SubmitButton>
+          <p className="mt-4 text-center text-sm text-muted-foreground">
+            Didn't receive the code?{" "}
+            <button type="button" onClick={resend} className="font-medium text-primary hover:underline">
+              Resend
+            </button>
+          </p>
+        </form>
+      </AuthLayout>
+    );
+  }
+
+  return (
+    <AuthLayout icon={UserPlus} title="Create your account" subtitle="Sign up to get started">
+      <GoogleButton returnTo={returnTo} onError={setError} />
+      <OrDivider />
+      <AuthError>{error}</AuthError>
+      <form onSubmit={register} className="space-y-4">
+        <div className="space-y-2">
+          <Label htmlFor="register-email">Email</Label>
+          <div className="relative">
+            <Mail className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+            <Input id="register-email" type="email" autoComplete="email" autoFocus placeholder="you@example.com" value={email} onChange={(e) => setEmail(e.target.value)} className="h-12 pl-10" disabled={busy} required />
+          </div>
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="register-password">Password</Label>
+          <div className="relative">
+            <Lock className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+            <Input id="register-password" type="password" autoComplete="new-password" placeholder="••••••••" value={password} onChange={(e) => setPassword(e.target.value)} className="h-12 pl-10" disabled={busy} required />
+          </div>
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="register-confirm">Confirm password</Label>
+          <div className="relative">
+            <Lock className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+            <Input id="register-confirm" type="password" autoComplete="new-password" placeholder="••••••••" value={confirm} onChange={(e) => setConfirm(e.target.value)} className="h-12 pl-10" disabled={busy} required />
+          </div>
+        </div>
+        <SubmitButton busy={busy} busyLabel="Creating account...">
+          Create account
+        </SubmitButton>
+      </form>
+      <p className="mt-6 text-center text-sm text-muted-foreground">
+        Already have an account?{" "}
+        <AuthLink to="/login" returnTo={returnTo}>
+          Log in
+        </AuthLink>
+      </p>
+    </AuthLayout>
+  );
+}
+import { Link } from "@tanstack/react-router";
+import { AlertTriangle, Lock } from "lucide-react";
+import { useState } from "react";
+import { base44 } from "@/api/base44Client";
+import { AuthLayout } from "@/components/auth/AuthLayout";
+import { AuthError, SubmitButton } from "@/components/auth/parts";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+
+// The /reset-password page; the reset email links here with ?token=.
+export function ResetPasswordPage() {
+  // Read raw: the router's search parser would turn an all-digit token into a number.
+  const token = new URLSearchParams(window.location.search).get("token");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e) {
+    e.preventDefault();
+    setError("");
+    if (password !== confirm) {
+      setError("Passwords do not match");
+      return;
+    }
+    setBusy(true);
+    try {
+      await base44.auth.resetPassword({ resetToken: token, newPassword: password });
+      window.location.href = "/login";
+    } catch (err) {
+      setError(err.message || "Failed to reset password");
+      setBusy(false);
+    }
+  }
+
+  if (!token) {
+    return (
+      <AuthLayout
+        icon={AlertTriangle}
+        title="Invalid reset link"
+        subtitle="This password reset link is missing or invalid"
+        footer={
+          <Link to="/forgot-password" className="font-medium text-primary hover:underline">
+            Request a new link
+          </Link>
+        }
+      >
+        <p className="text-center text-sm text-foreground">The link you used appears to be incomplete. Please request a new password reset email.</p>
+      </AuthLayout>
+    );
+  }
+  return (
+    <AuthLayout icon={Lock} title="New password" subtitle="Enter your new password below">
+      <AuthError>{error}</AuthError>
+      <form onSubmit={submit} className="space-y-4">
+        <div className="space-y-2">
+          <Label htmlFor="reset-password">New password</Label>
+          <div className="relative">
+            <Lock className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+            <Input id="reset-password" type="password" autoComplete="new-password" autoFocus placeholder="••••••••" value={password} onChange={(e) => setPassword(e.target.value)} className="h-12 pl-10" required />
+          </div>
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="reset-confirm">Confirm password</Label>
+          <div className="relative">
+            <Lock className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+            <Input id="reset-confirm" type="password" autoComplete="new-password" placeholder="••••••••" value={confirm} onChange={(e) => setConfirm(e.target.value)} className="h-12 pl-10" required />
+          </div>
+        </div>
+        <SubmitButton busy={busy} busyLabel="Resetting...">
+          Reset password
+        </SubmitButton>
+      </form>
+    </AuthLayout>
+  );
+}
+import { UserX } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { useAuth } from "@/lib/AuthContext";
+import { AuthLayout } from "./AuthLayout";
+
+// Signed in to Base44, but not a user of this app (invite-only apps).
+export function UserNotRegistered() {
+  const { logout } = useAuth();
+  return (
+    <AuthLayout icon={UserX} title="Access not granted" subtitle="Your account is not registered for this app.">
+      <p className="mb-6 text-center text-sm text-foreground">Ask the app owner for an invitation, or sign in with a different account.</p>
+      <Button variant="outline" className="h-12 w-full font-medium" onClick={logout}>
+        Sign out
+      </Button>
+    </AuthLayout>
+  );
+}
+import { useRef, useState } from "react";
+import { ArrowUp, Sparkles } from "lucide-react";
+
+export default function AiChatInput({ onSend, isGenerating }) {
+  const [value, setValue] = useState("");
+  const [focused, setFocused] = useState(false);
+  const ref = useRef(null);
+
+  const grow = () => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
+  };
+
+  const submit = () => {
+    const text = value.trim();
+    if (!text) return;
+    onSend(text);
+    setValue("");
+    if (ref.current) ref.current.style.height = "auto";
+  };
+
+  return (
+    <div className="mx-auto mt-8 w-full max-w-2xl">
+      <div
+        className={`relative rounded-[22px] p-px transition-all duration-300 ${
+          focused
+            ? "bg-gradient-to-r from-[#00d4ff] via-[#7dd3fc]/40 to-[#ff6bcb] shadow-[0_24px_70px_-34px_rgba(0,212,255,0.9)]"
+            : "bg-gradient-to-r from-[#00d4ff]/40 via-white/10 to-[#ff6bcb]/40"
+        }`}
+      >
+        <div className="relative overflow-hidden rounded-[21px] bg-[#070c16] px-3.5 py-3 sm:px-4">
+          <div className="flex items-end gap-2.5">
+            <span className="mb-1 grid h-8 w-8 flex-none place-items-center rounded-full bg-[#00d4ff]/10 text-[#65e5ff]">
+              <Sparkles className="h-4 w-4" strokeWidth={1.8} />
+            </span>
+
+            <label htmlFor="chat-idea" className="sr-only">
+              Descrivi la tua idea
+            </label>
+            <textarea
+              id="chat-idea"
+              ref={ref}
+              rows={1}
+              value={value}
+              onChange={(e) => {
+                setValue(e.target.value);
+                grow();
+              }}
+              onFocus={() => setFocused(true)}
+              onBlur={() => setFocused(false)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  submit();
+                }
+              }}
+              placeholder="Descrivi la scena che hai in mente…"
+              className="max-h-[140px] min-h-[26px] w-full flex-1 resize-none bg-transparent py-1 text-[14.5px] leading-relaxed text-[#e8f1fb] outline-none placeholder:text-[#5d6d84]"
+            />
+
+            <button
+              type="button"
+              onClick={submit}
+              disabled={isGenerating}
+              aria-label="Invia al generatore"
+              className="group grid h-9 w-9 flex-none place-items-center rounded-full bg-gradient-to-br from-[#66e7ff] to-[#ff6bcb] text-[#04121a] transition-all hover:scale-[1.06] hover:shadow-[0_10px_26px_-10px_rgba(0,212,255,0.95)] active:scale-95 disabled:opacity-50"
+            >
+              <ArrowUp className="h-[17px] w-[17px]" strokeWidth={2.2} />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <p className="mt-2.5 text-center text-[11.5px] text-[#64758d]">
+        Scrivi qui la tua idea — la inviamo direttamente al generatore.
+      </p>
+    </div>
+  );
+}
+import { ArrowRight } from "lucide-react";
+
+export default function CtaSection() {
+  return (
+    <section className="mx-auto w-full max-w-6xl px-5 pb-16 md:px-8 md:pb-24">
+      <div className="relative overflow-hidden rounded-[26px] border border-white/[0.08] bg-gradient-to-br from-[#0b1a2b] via-[#0a1220] to-[#170d22] px-6 py-14 text-center sm:px-10">
+        <div
+          aria-hidden
+          className="pointer-events-none absolute left-1/2 top-0 h-[260px] w-[600px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-[radial-gradient(ellipse_at_center,rgba(0,212,255,0.22),transparent_70%)] blur-2xl"
+        />
+        <div className="relative">
+          <h2 className="mx-auto max-w-xl font-heading text-[1.7rem] font-medium leading-tight tracking-tight text-white sm:text-[2.3rem]">
+            La prossima scena parte da <span className="font-display italic text-gradient">una frase</span>
+          </h2>
+          <p className="mx-auto mt-3 max-w-md text-[13.5px] leading-relaxed text-[#8496ad]">
+            Scrivi l'idea che hai in testa. Al resto pensa la direzione della fotografia.
+          </p>
+          <a
+            href="#generatore"
+            className="group mt-7 inline-flex items-center gap-2 rounded-full bg-gradient-to-r from-[#00d4ff] to-[#ff6bcb] px-6 py-3 font-heading text-[14px] font-semibold text-[#04121a] transition-all hover:shadow-[0_18px_45px_-18px_rgba(0,212,255,0.9)]"
+          >
+            Crea il tuo prompt
+            <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+          </a>
+        </div>
+      </div>
+    </section>
+  );
+}
+import {
+  Clapperboard,
+  Aperture,
+  History,
+  Monitor,
+  Languages,
+  ShieldCheck,
+} from "lucide-react";
+
+const FEATURES = [
+  {
+    icon: Clapperboard,
+    title: "Pronto per ogni modello",
+    text: "Struttura e linguaggio ottimizzati per Sora, Runway, Kling, Veo, Pika e per la generazione di immagini con Midjourney o Flux.",
+  },
+  {
+    icon: Aperture,
+    title: "Direzione della fotografia",
+    text: "Lenti, inquadrature, movimenti di macchina e luci motivate: il prompt include le scelte tecniche che fanno la differenza.",
+  },
+  {
+    icon: History,
+    title: "Libreria personale",
+    text: "Ogni prompt viene salvato in locale: ritrova, copia e rigenera le tue idee anche dopo aver chiuso la pagina.",
+  },
+  {
+    icon: Monitor,
+    title: "Formati per ogni piattaforma",
+    text: "Orizzontale, verticale per Reels e TikTok, CinemaScope o quadrato: il formato giusto fin dal primo tentativo.",
+  },
+  {
+    icon: Languages,
+    title: "Bilingue IT / EN",
+    text: "Scrivi l'idea in italiano e scegli se ottenere il prompt in inglese — la lingua che i modelli capiscono meglio — o in italiano.",
+  },
+  {
+    icon: ShieldCheck,
+    title: "Privacy reale",
+    text: "Il motore locale funziona senza account e senza inviare nulla in rete: le tue idee restano nel tuo browser.",
+  },
+];
+
+export default function Features() {
+  return (
+    <section id="funzioni" className="mx-auto w-full max-w-6xl px-5 py-16 md:px-8 md:py-24">
+      <div className="mx-auto max-w-2xl text-center">
+        <span className="text-[10.5px] font-semibold uppercase tracking-[0.18em] text-[#6f8199]">Funzioni</span>
+        <h2 className="mt-3 font-heading text-[1.75rem] font-medium leading-tight tracking-tight text-white sm:text-[2.4rem]">
+          Tutto quello che serve per <span className="font-display italic text-gradient">girare</span>
+        </h2>
+      </div>
+
+      <div className="mt-10 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {FEATURES.map(({ icon: Icon, title, text }) => (
+          <article
+            key={title}
+            className="group rounded-2xl border border-white/[0.07] bg-[#0a1220]/60 p-6 transition-all hover:-translate-y-0.5 hover:border-[#00d4ff]/25 hover:bg-[#0c1626]"
+          >
+            <span className="mb-5 grid h-10 w-10 place-items-center rounded-xl border border-[#00d4ff]/20 bg-[#00d4ff]/[0.07]">
+              <Icon className="h-[18px] w-[18px] text-[#65e5ff]" strokeWidth={1.7} />
+            </span>
+            <h3 className="font-heading text-[15.5px] font-medium text-white">{title}</h3>
+            <p className="mt-2 text-[13px] leading-relaxed text-[#8496ad]">{text}</p>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+import { ChevronDown, Sparkles, Loader2 } from "lucide-react";
+import { STYLE_OPTIONS, RATIO_OPTIONS, MODEL_OPTIONS } from "@/lib/promptEngine";
+
+const MAX = 600;
+
+function Field({ label, htmlFor, children }) {
+  return (
+    <label htmlFor={htmlFor} className="flex min-w-0 flex-col gap-1.5">
+      <span className="text-[10.5px] font-semibold uppercase tracking-[0.14em] text-[#7e8ea6]">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function Select({ id, value, onChange, options }) {
+  return (
+    <span className="relative block">
+      <select
+        id={id}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full appearance-none rounded-xl border border-white/10 bg-[#050910]/80 px-3.5 py-2.5 text-[13.5px] text-[#d7e2f0] outline-none transition-colors hover:border-white/20 focus:border-[#00d4ff]/60 focus:ring-2 focus:ring-[#00d4ff]/15"
+      >
+        {options.map((o) => (
+          <option key={o.value} value={o.value} className="bg-[#0b1120] text-[#e2e8f0]">
+            {o.label}
+          </option>
+        ))}
+      </select>
+      <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#6c7f99]" />
+    </span>
+  );
+}
+
+export default function GeneratorForm({
+  idea,
+  onIdeaChange,
+  styleKey,
+  onStyleChange,
+  ratio,
+  onRatioChange,
+  modelKey,
+  onModelChange,
+  lang,
+  onLangChange,
+  onSubmit,
+  isGenerating,
+}) {
+  const over = idea.length > MAX * 0.93;
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        onSubmit();
+      }}
+      className="panel relative overflow-hidden rounded-[22px] p-4 text-left sm:p-6"
+    >
+      <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-[#00d4ff]/50 to-transparent" />
+
+      <div className="mb-3 flex items-center justify-between">
+        <span className="text-[10.5px] font-semibold uppercase tracking-[0.14em] text-[#7e8ea6]">La tua idea</span>
+        <div className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-black/40 p-0.5">
+          {["en", "it"].map((code) => (
+            <button
+              key={code}
+              type="button"
+              onClick={() => onLangChange(code)}
+              aria-pressed={lang === code}
+              className={`rounded-md px-2.5 py-1 text-[11px] font-semibold uppercase transition-all ${
+                lang === code
+                  ? "bg-gradient-to-r from-[#00d4ff] to-[#ff6bcb] text-[#04121a]"
+                  : "text-[#7e8ea6] hover:text-[#c9d6e6]"
+              }`}
+            >
+              {code}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <textarea
+        id="idea"
+        value={idea}
+        onChange={(e) => onIdeaChange(e.target.value.slice(0, MAX))}
+        rows={4}
+        maxLength={MAX}
+        placeholder="Es. Un faro isolato durante una tempesta, una donna in impermeabile giallo guarda il mare in tempesta…"
+        className="w-full resize-none rounded-xl border border-white/10 bg-[#050910]/80 px-4 py-3.5 text-[14.5px] leading-relaxed text-[#e6eefa] outline-none transition-colors placeholder:text-[#5b6b82] focus:border-[#00d4ff]/60 focus:ring-2 focus:ring-[#00d4ff]/15"
+      />
+
+      <div className="mt-1.5 flex items-center justify-between px-1">
+        <span className="text-[11px] text-[#5f7089]">Prompt in {lang === "en" ? "inglese" : "italiano"}</span>
+        <span className={`font-mono text-[11px] ${over ? "text-[#ff8a8a]" : "text-[#5f7089]"}`}>
+          {idea.length} / {MAX}
+        </span>
+      </div>
+
+      <div className="mt-4 grid gap-3 sm:grid-cols-3">
+        <Field label="Stile visivo" htmlFor="style">
+          <Select id="style" value={styleKey} onChange={onStyleChange} options={STYLE_OPTIONS} />
+        </Field>
+        <Field label="Formato" htmlFor="ratio">
+          <Select id="ratio" value={ratio} onChange={onRatioChange} options={RATIO_OPTIONS} />
+        </Field>
+        <Field label="Modello" htmlFor="model">
+          <Select id="model" value={modelKey} onChange={onModelChange} options={MODEL_OPTIONS} />
+        </Field>
+      </div>
+
+      <button
+        type="submit"
+        disabled={isGenerating}
+        className="group mt-5 flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#00d4ff] via-[#3ee0f0] to-[#ff6bcb] px-6 py-3.5 font-heading text-[15px] font-semibold text-[#04121a] transition-all hover:shadow-[0_18px_50px_-20px_rgba(0,212,255,0.95)] disabled:opacity-60"
+      >
+        {isGenerating ? (
+          <>
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Elaborazione…
+          </>
+        ) : (
+          <>
+            <Sparkles className="h-4 w-4" />
+            Trasforma in prompt
+          </>
+        )}
+      </button>
+
+      <p className="mt-3 text-center text-[11.5px] text-[#65758c]">
+        <span className="text-[#8fe9ff]">Gratis e privato.</span> Il motore locale elabora tutto nel tuo browser.
+      </p>
+    </form>
+  );
+}
+import { Image } from "@/components/ui/image";
+import { ArrowUpRight } from "lucide-react";
+
+const SCENES = [
+  {
+    title: "Neon rain",
+    style: "scifi",
+    styleLabel: "Sci-fi / Cyberpunk",
+    src: "https://media.base44.com/images/public/6afa0626263efde290881588/36a6ee804_generated_image.png",
+    idea: "Una città al neon sotto la pioggia, un detective solitario attraversa un mercato affollato di ologrammi.",
+  },
+  {
+    title: "Desert dust",
+    style: "cinematico",
+    styleLabel: "Cinematografico",
+    src: "https://media.base44.com/images/public/6afa0626263efde290881588/5a07eab51_generated_image.png",
+    idea: "Un viaggiatore solitario attraversa il deserto al tramonto, la polvere illumina l'aria, una tempesta si avvicina.",
+  },
+  {
+    title: "Last light",
+    style: "noir",
+    styleLabel: "Noir",
+    src: "https://media.base44.com/images/public/6afa0626263efde290881588/5e0f800bb_generated_image.png",
+    idea: "Un uomo in un ufficio vuoto di notte, una lampada da tavolo, ombre di tapparelle sul muro, fumo di sigaretta nell'aria.",
+  },
+  {
+    title: "Into the mist",
+    style: "horror",
+    styleLabel: "Horror",
+    src: "https://media.base44.com/images/public/6afa0626263efde290881588/36c039bfe_generated_image.png",
+    idea: "Un sentiero nel bosco scompare nella nebbia all'alba, tracce di passi nel fango, silenzio assoluto.",
+  },
+  {
+    title: "Orbital drift",
+    style: "scifi",
+    styleLabel: "Sci-fi",
+    src: "https://media.base44.com/images/public/6afa0626263efde290881588/78852b487_generated_image.png",
+    idea: "Una stazione spaziale abbandonata in orbita, detriti che fluttuano, la Terra che si riflette nel vetro crepato.",
+  },
+  {
+    title: "Golden hour",
+    style: "vintage",
+    styleLabel: "Vintage",
+    src: "https://media.base44.com/images/public/6afa0626263efde290881588/503b55e06_generated_image.png",
+    idea: "Due anziani ballano in una cucina di campagna al tramonto, luce calda, dischi in vinile, polvere nell'aria.",
+  },
+];
+
+export default function InspirationGallery({ onPick }) {
+  return (
+    <section id="galleria" className="mx-auto w-full max-w-6xl px-5 py-16 md:px-8 md:py-24">
+      <div className="mx-auto max-w-2xl text-center">
+        <span className="text-[10.5px] font-semibold uppercase tracking-[0.18em] text-[#6f8199]">Ispirazioni</span>
+        <h2 className="mt-3 font-heading text-[1.75rem] font-medium leading-tight tracking-tight text-white sm:text-[2.4rem]">
+          Ispirazioni dalla <span className="font-display italic text-gradient">galleria</span>
+        </h2>
+        <p className="mt-3 text-[13.5px] leading-relaxed text-[#8496ad]">
+          Sei scenari di partenza. Scegline uno per caricare l'idea nel generatore.
+        </p>
+      </div>
+
+      <div className="mt-9 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {SCENES.map((scene) => (
+          <button
+            key={scene.title}
+            type="button"
+            onClick={() => onPick({ idea: scene.idea, style: scene.style })}
+            className="group relative aspect-video overflow-hidden rounded-2xl border border-white/[0.08] text-left transition-all hover:-translate-y-1 hover:border-[#00d4ff]/40 hover:shadow-[0_24px_60px_-30px_rgba(0,0,0,0.95)]"
+          >
+            <Image
+              src={scene.src}
+              alt={`${scene.title} — esempio ${scene.styleLabel}`}
+              className="absolute inset-0 h-full w-full object-cover transition-transform duration-700 group-hover:scale-[1.06]"
+            />
+            <span className="absolute inset-0 bg-gradient-to-t from-[#04070e] via-[#04070e]/25 to-transparent" />
+
+            <span className="absolute inset-x-4 bottom-3.5 z-10 flex items-end justify-between gap-3">
+              <span>
+                <span className="block font-heading text-[14px] font-medium text-white">{scene.title}</span>
+                <span className="mt-0.5 block text-[11px] text-white/60">{scene.styleLabel}</span>
+              </span>
+              <span className="grid h-8 w-8 flex-none place-items-center rounded-full border border-white/25 bg-black/40 text-white backdrop-blur transition-colors group-hover:border-[#00d4ff] group-hover:bg-[#00d4ff] group-hover:text-[#04121a]">
+                <ArrowUpRight className="h-3.5 w-3.5" />
+              </span>
+            </span>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+const MODELS = [
+  { name: "Qwen 2.5", text: "Modello linguistico avanzato, ideale per testi lunghi, ragionamento complesso e scrittura creativa." },
+  { name: "Qwen VL", text: "Comprende immagini e testo insieme — descrivi una foto e ottieni spiegazioni precise." },
+  { name: "Qwen Audio", text: "Trascrizione e traduzione vocale naturale — converti l'audio in testo con precisione." },
+  { name: "Qwen Video", text: "Comprensione e generazione video — analizza scene o crea contenuti visivi in movimento." },
+];
+
+export default function ModelShowcase() {
+  return (
+    <section id="modelli" className="mx-auto w-full max-w-6xl px-5 py-16 md:px-8 md:py-24">
+      <div className="mx-auto max-w-2xl text-center">
+        <div className="flex flex-wrap items-center justify-center gap-3">
+          <h2 className="font-heading text-[1.75rem] font-medium tracking-tight text-white sm:text-[2.1rem]">
+            Qwen
+          </h2>
+          <span className="rounded-full bg-gradient-to-r from-[#00d4ff] to-[#ff6bcb] px-3 py-1 text-[10.5px] font-bold uppercase tracking-[0.08em] text-[#04121a]">
+            Gratis &amp; open source
+          </span>
+        </div>
+        <p className="mt-3 text-[13.5px] leading-relaxed text-[#8496ad]">
+          Modelli AI potenti, versatili e completamente gratuiti — senza costi nascosti.
+        </p>
+      </div>
+
+      <div className="mt-9 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {MODELS.map((model) => (
+          <article
+            key={model.name}
+            className="flex flex-col rounded-2xl border border-white/[0.07] bg-[#0a1220]/60 p-5 transition-colors hover:border-[#00d4ff]/25"
+          >
+            <h3 className="font-heading text-[14.5px] font-medium text-white">{model.name}</h3>
+            <p className="mt-2 flex-1 text-[12.5px] leading-relaxed text-[#8496ad]">{model.text}</p>
+            <span className="mt-4 self-start rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-1 text-[10.5px] font-semibold text-[#a7f3d0]">
+              Gratis
+            </span>
+          </article>
+        ))}
+      </div>
+
+      <p className="mx-auto mt-6 max-w-2xl rounded-xl border border-[#00d4ff]/12 bg-[#00d4ff]/[0.04] px-5 py-4 text-center text-[12.5px] leading-relaxed text-[#8496ad]">
+        Tutti i modelli Qwen sono sviluppati da Alibaba Cloud e rilasciati con licenza aperta.{" "}
+        <strong className="font-semibold text-[#d6e2f1]">Nessun costo per progetti personali.</strong>
+      </p>
+    </section>
+  );
+}
+import { Check } from "lucide-react";
+import { toast } from "sonner";
+
+const PLANS = [
+  {
+    name: "Free",
+    price: "0 €",
+    suffix: "",
+    note: "Per sempre. Nessuna carta.",
+    items: [
+      "Prompt cinematografici illimitati",
+      "8 stili visivi",
+      "5 formati video",
+      "Libreria locale (20 prompt)",
+      "Copia e download .txt",
+    ],
+    cta: "Inizia gratis",
+    highlighted: false,
+  },
+  {
+    name: "Pro",
+    price: "9 €",
+    suffix: "/ mese",
+    note: "Per chi crea ogni giorno.",
+    items: [
+      "Tutto del piano Free",
+      "Libreria illimitata e ricerca",
+      "Stili e preset esclusivi",
+      "Prompt in batch (fino a 10 scene)",
+      "Supporto prioritario",
+    ],
+    cta: "Passa a Pro",
+    highlighted: true,
+  },
+];
+
+export default function Pricing() {
+  return (
+    <section id="prezzi" className="mx-auto w-full max-w-6xl px-5 py-16 md:px-8 md:py-24">
+      <div className="mx-auto max-w-2xl text-center">
+        <span className="text-[10.5px] font-semibold uppercase tracking-[0.18em] text-[#6f8199]">Prezzi</span>
+        <h2 className="mt-3 font-heading text-[1.75rem] font-medium leading-tight tracking-tight text-white sm:text-[2.4rem]">
+          Semplice, come dovrebbe <span className="font-display italic text-gradient">essere</span>
+        </h2>
+      </div>
+
+      <div className="mx-auto mt-10 grid max-w-3xl gap-4 sm:grid-cols-2">
+        {PLANS.map((plan) => (
+          <div
+            key={plan.name}
+            className={`relative flex flex-col rounded-[22px] border p-7 ${
+              plan.highlighted
+                ? "border-[#ff6bcb]/40 bg-gradient-to-b from-[#1a1026]/90 to-[#0a0d18]/90 shadow-[0_30px_80px_-50px_rgba(255,107,203,0.8)]"
+                : "border-white/[0.08] bg-[#0a1220]/70"
+            }`}
+          >
+            {plan.highlighted && (
+              <span className="absolute -top-3 left-7 rounded-full bg-gradient-to-r from-[#00d4ff] to-[#ff6bcb] px-3 py-1 text-[10.5px] font-bold uppercase tracking-[0.08em] text-[#04121a]">
+                Più popolare
+              </span>
+            )}
+            <h3 className="font-heading text-[17px] font-medium text-white">{plan.name}</h3>
+            <div className="mt-3 flex items-baseline gap-1.5">
+              <span className="font-heading text-[34px] font-semibold tracking-tight text-white">{plan.price}</span>
+              {plan.suffix && <span className="text-[13px] text-[#8496ad]">{plan.suffix}</span>}
+            </div>
+            <p className="mt-1 text-[12.5px] text-[#7e8ea6]">{plan.note}</p>
+
+            <ul className="mt-5 flex-1 space-y-2.5">
+              {plan.items.map((item) => (
+                <li key={item} className="flex items-start gap-2 text-[13px] leading-relaxed text-[#a3b2c6]">
+                  <Check className="mt-0.5 h-3.5 w-3.5 flex-none text-[#00d4ff]" strokeWidth={2.4} />
+                  {item}
+                </li>
+              ))}
+            </ul>
+
+            {plan.highlighted ? (
+              <button
+                type="button"
+                onClick={() =>
+                  toast("Il piano Pro arriverà presto: seguici su Instagram per essere avvisato.")
+                }
+                className="mt-6 w-full rounded-xl bg-gradient-to-r from-[#00d4ff] to-[#ff6bcb] px-5 py-3 font-heading text-[13.5px] font-semibold text-[#04121a] transition-all hover:shadow-[0_16px_40px_-18px_rgba(0,212,255,0.9)]"
+              >
+                {plan.cta}
+              </button>
+            ) : (
+              <a
+                href="#generatore"
+                className="mt-6 block w-full rounded-xl border border-white/15 px-5 py-3 text-center font-heading text-[13.5px] font-semibold text-white transition-colors hover:border-[#00d4ff]/50 hover:text-[#8fe9ff]"
+              >
+                {plan.cta}
+              </a>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+import { History, Trash2 } from "lucide-react";
+import { formatHistoryDate } from "@/lib/usePromptLibrary";
+
+export default function PromptLibrary({ items, onOpen, onClear }) {
+  return (
+    <section id="libreria" className="mx-auto w-full max-w-3xl px-5 py-16 md:px-8 md:py-24">
+      <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <span className="text-[10.5px] font-semibold uppercase tracking-[0.18em] text-[#6f8199]">Archivio</span>
+          <h2 className="mt-2 font-heading text-2xl font-medium tracking-tight text-white sm:text-3xl">
+            La tua <span className="font-display italic text-gradient">libreria</span>
+          </h2>
+        </div>
+        {items.length > 0 && (
+          <button
+            type="button"
+            onClick={onClear}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-2 text-[12px] text-[#8b9cb4] transition-colors hover:border-[#ff8a8a]/40 hover:text-[#ffb3b3]"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            Svuota libreria
+          </button>
+        )}
+      </div>
+
+      {items.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-white/10 px-6 py-12 text-center">
+          <History className="mx-auto h-6 w-6 text-[#4c5c73]" />
+          <p className="mx-auto mt-3 max-w-sm text-[13.5px] leading-relaxed text-[#7e8ea6]">
+            La libreria è vuota. Genera il primo prompt e lo troverai qui, salvato solo su questo dispositivo.
+          </p>
+        </div>
+      ) : (
+        <ul className="space-y-2.5">
+          {items.map((item) => (
+            <li key={item.id}>
+              <button
+                type="button"
+                onClick={() => onOpen(item)}
+                className="group w-full rounded-xl border border-white/[0.07] border-l-2 border-l-[#00d4ff]/60 bg-[#0a1220]/70 px-4 py-3.5 text-left transition-all hover:border-l-[#ff6bcb] hover:bg-[#0d1728]"
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="rounded-full border border-[#ff6bcb]/30 px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-[#ff9ad8]">
+                    {item.styleLabel}
+                  </span>
+                  {item.modelLabel && item.model !== "generico" && (
+                    <span className="rounded-full border border-[#00d4ff]/30 px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-[#8fe9ff]">
+                      {item.modelLabel}
+                    </span>
+                  )}
+                  <span className="truncate text-[12.5px] text-[#8b9cb4]">{item.idea}</span>
+                </div>
+                <p className="mt-2 line-clamp-2 font-mono text-[11.5px] leading-relaxed text-[#a9b8cc]">
+                  {item.text.replace(/\n+/g, " ")}
+                </p>
+                <div className="mt-1.5 text-[10.5px] text-[#5f7089]">{formatHistoryDate(item.at)}</div>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+import { useRef, useState } from "react";
+import { toast } from "sonner";
+import StudioHero from "@/components/site/StudioHero";
+import AiChatInput from "@/components/site/AiChatInput";
+import GeneratorForm from "@/components/site/GeneratorForm";
+import ResultCard from "@/components/site/ResultCard";
+import PromptLibrary from "@/components/site/PromptLibrary";
+import InspirationGallery from "@/components/site/InspirationGallery";
+import StatsStrip from "@/components/site/StatsStrip";
+import { buildPrompt, styleLabel, modelLabel } from "@/lib/promptEngine";
+import { usePromptLibrary } from "@/lib/usePromptLibrary";
+
+export default function PromptStudio() {
+  const [idea, setIdea] = useState("");
+  const [styleKey, setStyleKey] = useState("cinematico");
+  const [ratio, setRatio] = useState("16:9");
+  const [modelKey, setModelKey] = useState("generico");
+  const [lang, setLang] = useState("en");
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [result, setResult] = useState(null);
+  const resultRef = useRef(null);
+  const { items, add, clear } = usePromptLibrary();
+
+  const run = async (rawIdea) => {
+    const trimmed = rawIdea.trim();
+    if (trimmed.length < 3) {
+      toast.error("Scrivi almeno una frase per descrivere la scena.");
+      document.getElementById("idea")?.focus();
+      return;
+    }
+
+    setIsGenerating(true);
+    await new Promise((resolve) => setTimeout(resolve, 380));
+
+    const entry = {
+      id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+      idea: trimmed,
+      styleKey,
+      styleLabel: styleLabel(styleKey),
+      model: modelKey,
+      modelLabel: modelLabel(modelKey),
+      text: buildPrompt({ idea: trimmed, styleKey, ratio, lang, modelKey }),
+      at: new Date().toISOString(),
+    };
+
+    setResult(entry);
+    add(entry);
+    setIsGenerating(false);
+    setTimeout(() => resultRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }), 60);
+  };
+
+  const openFromLibrary = (item) => {
+    setIdea(item.idea);
+    setStyleKey(item.styleKey || "cinematico");
+    setModelKey(item.model || "generico");
+    setResult(item);
+    setTimeout(() => resultRef.current?.scrollIntoView({ behavior: "smooth", block: "center" }), 60);
+  };
+
+  const pickIdea = ({ idea: pickedIdea, style }) => {
+    setIdea(pickedIdea);
+    if (style) setStyleKey(style);
+    document.getElementById("generatore")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
+  return (
+    <>
+      <div className="relative overflow-hidden">
+        <div aria-hidden className="pointer-events-none absolute inset-0 grid-lines" />
+        <div
+          aria-hidden
+          className="pointer-events-none absolute left-1/2 top-[-140px] h-[420px] w-[820px] -translate-x-1/2 rounded-full bg-[radial-gradient(ellipse_at_center,rgba(0,212,255,0.18),rgba(255,107,203,0.07),transparent_70%)] blur-2xl"
+        />
+
+        <section id="generatore" className="relative mx-auto w-full max-w-6xl px-5 pb-16 pt-14 md:px-8 md:pb-24 md:pt-20">
+          <StudioHero />
+          <AiChatInput
+            isGenerating={isGenerating}
+            onSend={(text) => {
+              setIdea(text);
+              run(text);
+            }}
+          />
+          <div className="mx-auto mt-9 max-w-2xl">
+            <GeneratorForm
+              idea={idea}
+              onIdeaChange={setIdea}
+              styleKey={styleKey}
+              onStyleChange={setStyleKey}
+              ratio={ratio}
+              onRatioChange={setRatio}
+              modelKey={modelKey}
+              onModelChange={setModelKey}
+              lang={lang}
+              onLangChange={setLang}
+              onSubmit={() => run(idea)}
+              isGenerating={isGenerating}
+            />
+            <div ref={resultRef}>
+              {result && (
+                <ResultCard
+                  result={result}
+                  onRegenerate={() => run(idea)}
+                  isGenerating={isGenerating}
+                />
+              )}
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <StatsStrip />
+      <PromptLibrary items={items} onOpen={openFromLibrary} onClear={clear} />
+      <InspirationGallery onPick={pickIdea} />
+    </>
+  );
+}
+import { useRef, useState } from "react";
+import { motion } from "framer-motion";
+import { Check, Copy, Download, RefreshCw, ScrollText } from "lucide-react";
+import { toast } from "sonner";
+
+export default function ResultCard({ result, onRegenerate, isGenerating }) {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef(null);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(result.text);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = result.text;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    setCopied(true);
+    toast.success("Prompt copiato negli appunti");
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => setCopied(false), 2200);
+  };
+
+  const download = () => {
+    const blob = new Blob([result.text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "promptai-cinema-prompt.txt";
+    a.click();
+    URL.revokeObjectURL(url);
+    toast.success("File .txt scaricato");
+  };
+
+  const action =
+    "inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-[12.5px] transition-colors";
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 14 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
+      className="panel mt-5 overflow-hidden rounded-[22px] border-[#ff6bcb]/20 text-left"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/5 px-4 py-3 sm:px-5">
+        <span className="inline-flex items-center gap-2 font-heading text-[13px] font-semibold text-[#ff9ad8]">
+          <ScrollText className="h-3.5 w-3.5" />
+          Il tuo prompt cinematografico
+        </span>
+        <span className="rounded-full border border-white/10 px-2.5 py-0.5 text-[10.5px] uppercase tracking-[0.12em] text-[#7e8ea6]">
+          {result.styleLabel}
+        </span>
+      </div>
+
+      <div className="max-h-[360px] overflow-y-auto px-4 py-4 sm:px-5">
+        <pre className="prose-prompt text-[#dbe6f4]">{result.text}</pre>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 border-t border-white/5 px-4 py-3 sm:px-5">
+        <button
+          type="button"
+          onClick={copy}
+          className={`${action} border-[#00d4ff]/50 text-[#8fe9ff] hover:bg-[#00d4ff]/10`}
+        >
+          {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+          {copied ? "Copiato" : "Copia prompt"}
+        </button>
+        <button
+          type="button"
+          onClick={onRegenerate}
+          disabled={isGenerating}
+          className={`${action} border-[#00d4ff]/50 text-[#8fe9ff] hover:bg-[#00d4ff]/10 disabled:opacity-50`}
+        >
+          <RefreshCw className={`h-3.5 w-3.5 ${isGenerating ? "animate-spin" : ""}`} />
+          Rigenera
+        </button>
+        <button
+          type="button"
+          onClick={download}
+          className={`${action} border-white/10 text-[#8b9cb4] hover:bg-white/5 hover:text-white`}
+        >
+          <Download className="h-3.5 w-3.5" />
+          Scarica .txt
+        </button>
+      </div>
+    </motion.div>
+  );
+}
+import { Instagram, Mail } from "lucide-react";
+
+const COLUMNS = [
+  {
+    title: "Prodotto",
+    links: [
+      { label: "Generatore", href: "#generatore" },
+      { label: "Galleria", href: "#galleria" },
+      { label: "Prezzi", href: "#prezzi" },
+    ],
+  },
+  {
+    title: "Risorse",
+    links: [
+      { label: "Funzioni", href: "#funzioni" },
+      { label: "Modelli", href: "#modelli" },
+      { label: "Libreria", href: "#libreria" },
+    ],
+  },
+];
+
+export default function SiteFooter() {
+  return (
+    <footer className="border-t border-white/5">
+      <div className="mx-auto w-full max-w-6xl px-5 py-12 md:px-8 md:py-16">
+        <div className="grid gap-10 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="lg:col-span-2">
+            <div className="flex items-center gap-2.5">
+              <span className="grid h-9 w-9 place-items-center rounded-[11px] bg-gradient-to-br from-[#00d4ff] to-[#ff6bcb] font-heading text-base font-bold text-[#04121a]">
+                P
+              </span>
+              <span className="font-heading text-[16px] font-semibold text-white">
+                Prompt<span className="text-[#8fa3bd]">AI</span> Cinema
+              </span>
+            </div>
+            <p className="mt-4 max-w-xs text-[13px] leading-relaxed text-[#7e8ea6]">
+              Prompt cinematografici per la nuova generazione di registi.
+            </p>
+          </div>
+
+          {COLUMNS.map((col) => (
+            <div key={col.title}>
+              <h3 className="font-heading text-[12px] font-semibold uppercase tracking-[0.14em] text-[#5f7089]">
+                {col.title}
+              </h3>
+              <ul className="mt-4 space-y-2.5">
+                {col.links.map((link) => (
+                  <li key={link.href}>
+                    <a
+                      href={link.href}
+                      className="text-[13px] text-[#93a3ba] transition-colors hover:text-[#7de9ff]"
+                    >
+                      {link.label}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-10 flex flex-col items-center justify-between gap-4 border-t border-white/5 pt-6 sm:flex-row">
+          <div className="flex items-center gap-3">
+            <a
+              href="https://www.instagram.com/"
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="Instagram"
+              className="grid h-9 w-9 place-items-center rounded-full border border-white/10 text-[#93a3ba] transition-colors hover:border-[#ff6bcb]/40 hover:text-[#ff9ad8]"
+            >
+              <Instagram className="h-4 w-4" strokeWidth={1.7} />
+            </a>
+            <a
+              href="mailto:ciao@promptaicinema.it"
+              aria-label="Scrivici una email"
+              className="grid h-9 w-9 place-items-center rounded-full border border-white/10 text-[#93a3ba] transition-colors hover:border-[#00d4ff]/40 hover:text-[#8fe9ff]"
+            >
+              <Mail className="h-4 w-4" strokeWidth={1.7} />
+            </a>
+          </div>
+          <p className="text-center text-[11.5px] text-[#5f7089]">
+            © 2026 PromptAI Cinema · I prompt restano nel tuo browser
+          </p>
+        </div>
+      </div>
+    </footer>
+  );
+}
+import { useState } from "react";
+import { Instagram, Menu, X, ArrowUpRight } from "lucide-react";
+
+const NAV = [
+  { label: "Generatore", href: "#generatore" },
+  { label: "Galleria", href: "#galleria" },
+  { label: "Funzioni", href: "#funzioni" },
+  { label: "Prezzi", href: "#prezzi" },
+];
+
+export default function SiteHeader() {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <header className="sticky top-0 z-50 border-b border-white/5 bg-[#05070f]/80 backdrop-blur-xl">
+      <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-4 px-5 py-3.5 md:px-8">
+        <a href="#top" className="group flex items-center gap-2.5">
+          <span className="grid h-9 w-9 place-items-center rounded-[11px] bg-gradient-to-br from-[#00d4ff] to-[#ff6bcb] font-heading text-base font-bold text-[#04121a] shadow-[0_0_24px_-6px_rgba(0,212,255,0.7)]">
+            P
+          </span>
+          <span className="font-heading text-[17px] font-semibold tracking-tight text-white">
+            Prompt<span className="text-[#8fa3bd]">AI</span> Cinema
+          </span>
+        </a>
+
+        <nav className="hidden items-center gap-7 md:flex" aria-label="Navigazione principale">
+          {NAV.map((item) => (
+            <a
+              key={item.href}
+              href={item.href}
+              className="text-[14px] text-[#93a3ba] transition-colors hover:text-[#7de9ff]"
+            >
+              {item.label}
+            </a>
+          ))}
+          <a
+            href="https://www.instagram.com/"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Seguici su Instagram"
+            className="text-[#93a3ba] transition-colors hover:text-[#ff9ad8]"
+          >
+            <Instagram className="h-[18px] w-[18px]" strokeWidth={1.7} />
+          </a>
+          <a
+            href="#generatore"
+            className="group inline-flex items-center gap-1.5 rounded-full bg-gradient-to-r from-[#00d4ff] to-[#ff6bcb] px-5 py-2 text-[13.5px] font-semibold text-[#04121a] transition-all hover:shadow-[0_10px_30px_-12px_rgba(0,212,255,0.9)]"
+          >
+            Crea prompt
+            <ArrowUpRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
+          </a>
+        </nav>
+
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-label={open ? "Chiudi il menu" : "Apri il menu"}
+          aria-expanded={open}
+          className="grid h-10 w-10 place-items-center rounded-xl border border-white/10 text-white/80 md:hidden"
+        >
+          {open ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+        </button>
+      </div>
+
+      {open && (
+        <div className="border-t border-white/5 bg-[#05070f]/97 px-5 pb-5 pt-2 md:hidden">
+          <nav className="flex flex-col" aria-label="Navigazione mobile">
+            {NAV.map((item) => (
+              <a
+                key={item.href}
+                href={item.href}
+                onClick={() => setOpen(false)}
+                className="border-b border-white/5 py-3 text-[15px] text-[#c3cfdf]"
+              >
+                {item.label}
+              </a>
+            ))}
+            <a
+              href="#generatore"
+              onClick={() => setOpen(false)}
+              className="mt-4 rounded-full bg-gradient-to-r from-[#00d4ff] to-[#ff6bcb] px-5 py-2.5 text-center text-[14px] font-semibold text-[#04121a]"
+            >
+              Crea prompt
+            </a>
+          </nav>
+        </div>
+      )}
+    </header>
+  );
+}
+const STATS = [
+  { value: "8", label: "Stili visivi pronti" },
+  { value: "0 €", label: "Per iniziare" },
+  { value: "100%", label: "Elaborazione nel browser" },
+  { value: "∞", label: "Prompt al giorno" },
+];
+
+export default function StatsStrip() {
+  return (
+    <section aria-label="Numeri" className="mx-auto w-full max-w-6xl px-5 md:px-8">
+      <div className="grid grid-cols-2 gap-3 border-y border-white/5 py-6 sm:grid-cols-4 sm:gap-4">
+        {STATS.map((stat) => (
+          <div key={stat.label} className="px-2 text-center">
+            <div className="font-heading text-[26px] font-semibold tracking-tight text-white sm:text-[30px]">
+              {stat.value}
+            </div>
+            <div className="mt-1 text-[11.5px] leading-snug text-[#7e8ea6]">{stat.label}</div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+import { motion } from "framer-motion";
+
+const fade = {
+  hidden: { opacity: 0, y: 18 },
+  show: (i) => ({
+    opacity: 1,
+    y: 0,
+    transition: { duration: 0.7, delay: i * 0.08, ease: [0.22, 1, 0.36, 1] },
+  }),
+};
+
+export default function StudioHero() {
+  return (
+    <div className="relative mx-auto max-w-3xl px-1 text-center">
+      <motion.div variants={fade} custom={0} initial="hidden" animate="show">
+        <span className="inline-flex items-center gap-2 rounded-full border border-[#00d4ff]/25 bg-[#00d4ff]/[0.07] px-4 py-1.5 text-[12.5px] text-[#8fe9ff]">
+          <span className="relative flex h-1.5 w-1.5">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#00d4ff] opacity-70" />
+            <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-[#00d4ff]" />
+          </span>
+          Generatore di prompt cinematografici con IA
+        </span>
+      </motion.div>
+
+      <motion.h1
+        variants={fade}
+        custom={1}
+        initial="hidden"
+        animate="show"
+        className="mt-7 font-heading text-[2.45rem] font-medium leading-[1.08] tracking-[-0.03em] text-white sm:text-6xl"
+      >
+        Dalla tua idea al
+        <br />
+        <span className="font-display font-normal italic text-gradient">prompt cinematografico</span>
+      </motion.h1>
+
+      <motion.p
+        variants={fade}
+        custom={2}
+        initial="hidden"
+        animate="show"
+        className="mx-auto mt-5 max-w-xl text-[15px] leading-relaxed text-[#9aa9be] sm:text-base"
+      >
+        Descrivi una scena in italiano. PromptAI Cinema la trasforma in un prompt professionale —
+        inquadratura, lenti, luce, color grading — pronto per Sora, Runway, Kling, Veo e Midjourney.
+      </motion.p>
+    </div>
+  );
+}
+import * as React from "react"
+import * as AccordionPrimitive from "@radix-ui/react-accordion"
+import { ChevronDown } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+
+const Accordion = AccordionPrimitive.Root
+
+const AccordionItem = React.forwardRef(({ className, ...props }, ref) => (
+  <AccordionPrimitive.Item ref={ref} className={cn("border-b", className)} {...props} />
+))
+AccordionItem.displayName = "AccordionItem"
+
+const AccordionTrigger = React.forwardRef(({ className, children, ...props }, ref) => (
+  <AccordionPrimitive.Header className="flex">
+    <AccordionPrimitive.Trigger
+      ref={ref}
+      className={cn(
+        "flex flex-1 items-center justify-between py-4 text-sm font-medium transition-all hover:underline text-left [&[data-state=open]>svg]:rotate-180",
+        className
+      )}
+      {...props}>
+      {children}
+      <ChevronDown
+        className="h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200" />
+    </AccordionPrimitive.Trigger>
+  </AccordionPrimitive.Header>
+))
+AccordionTrigger.displayName = AccordionPrimitive.Trigger.displayName
+
+const AccordionContent = React.forwardRef(({ className, children, ...props }, ref) => (
+  <AccordionPrimitive.Content
+    ref={ref}
+    className="overflow-hidden text-sm data-[state=closed]:animate-accordion-up data-[state=open]:animate-accordion-down"
+    {...props}>
+    <div className={cn("pb-4 pt-0", className)}>{children}</div>
+  </AccordionPrimitive.Content>
+))
+AccordionContent.displayName = AccordionPrimitive.Content.displayName
+
+export { Accordion, AccordionItem, AccordionTrigger, AccordionContent }
+import * as React from "react"
+import * as AlertDialogPrimitive from "@radix-ui/react-alert-dialog"
+
+import { cn } from "@/lib/utils"
+import { buttonVariants } from "@/components/ui/button"
+
+const AlertDialog = AlertDialogPrimitive.Root
+
+const AlertDialogTrigger = AlertDialogPrimitive.Trigger
+
+const AlertDialogPortal = AlertDialogPrimitive.Portal
+
+const AlertDialogOverlay = React.forwardRef(({ className, ...props }, ref) => (
+  <AlertDialogPrimitive.Overlay
+    className={cn(
+      "fixed inset-0 z-50 bg-black/80 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+      className
+    )}
+    {...props}
+    ref={ref} />
+))
+AlertDialogOverlay.displayName = AlertDialogPrimitive.Overlay.displayName
+
+const AlertDialogContent = React.forwardRef(({ className, ...props }, ref) => (
+  <AlertDialogPortal>
+    <AlertDialogOverlay />
+    <AlertDialogPrimitive.Content
+      ref={ref}
+      className={cn(
+        "fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 border bg-background p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] sm:rounded-lg",
+        className
+      )}
+      {...props} />
+  </AlertDialogPortal>
+))
+AlertDialogContent.displayName = AlertDialogPrimitive.Content.displayName
+
+const AlertDialogHeader = ({
+  className,
+  ...props
+}) => (
+  <div
+    className={cn("flex flex-col space-y-2 text-center sm:text-left", className)}
+    {...props} />
+)
+AlertDialogHeader.displayName = "AlertDialogHeader"
+
+const AlertDialogFooter = ({
+  className,
+  ...props
+}) => (
+  <div
+    className={cn("flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2", className)}
+    {...props} />
+)
+AlertDialogFooter.displayName = "AlertDialogFooter"
+
+const AlertDialogTitle = React.forwardRef(({ className, ...props }, ref) => (
+  <AlertDialogPrimitive.Title ref={ref} className={cn("text-lg font-semibold", className)} {...props} />
+))
+AlertDialogTitle.displayName = AlertDialogPrimitive.Title.displayName
+
+const AlertDialogDescription = React.forwardRef(({ className, ...props }, ref) => (
+  <AlertDialogPrimitive.Description
+    ref={ref}
+    className={cn("text-sm text-muted-foreground", className)}
+    {...props} />
+))
+AlertDialogDescription.displayName =
+  AlertDialogPrimitive.Description.displayName
+
+const AlertDialogAction = React.forwardRef(({ className, ...props }, ref) => (
+  <AlertDialogPrimitive.Action ref={ref} className={cn(buttonVariants(), className)} {...props} />
+))
+AlertDialogAction.displayName = AlertDialogPrimitive.Action.displayName
+
+const AlertDialogCancel = React.forwardRef(({ className, ...props }, ref) => (
+  <AlertDialogPrimitive.Cancel
+    ref={ref}
+    className={cn(buttonVariants({ variant: "outline" }), "mt-2 sm:mt-0", className)}
+    {...props} />
+))
+AlertDialogCancel.displayName = AlertDialogPrimitive.Cancel.displayName
+
+export {
+  AlertDialog,
+  AlertDialogPortal,
+  AlertDialogOverlay,
+  AlertDialogTrigger,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogFooter,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogAction,
+  AlertDialogCancel,
+}
+import * as React from "react"
+import { Slot } from "@radix-ui/react-slot"
+import { cva } from "class-variance-authority";
+
+import { cn } from "@/lib/utils"
+
+const buttonVariants = cva(
+  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+  {
+    variants: {
+      variant: {
+        default:
+          "bg-primary text-primary-foreground shadow hover:bg-primary/90",
+        destructive:
+          "bg-destructive text-destructive-foreground shadow-sm hover:bg-destructive/90",
+        outline:
+          "border border-input bg-transparent shadow-sm hover:bg-accent hover:text-accent-foreground",
+        secondary:
+          "bg-secondary text-secondary-foreground shadow-sm hover:bg-secondary/80",
+        ghost: "hover:bg-accent hover:text-accent-foreground",
+        link: "text-primary underline-offset-4 hover:underline",
+      },
+      size: {
+        default: "h-9 px-4 py-2",
+        sm: "h-8 rounded-md px-3 text-xs",
+        lg: "h-10 rounded-md px-8",
+        icon: "h-9 w-9",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+      size: "default",
+    },
+  }
+)
+
+const Button = React.forwardRef(({ className, variant, size, asChild = false, ...props }, ref) => {
+  const Comp = asChild ? Slot : "button"
+  return (
+    (<Comp
+      className={cn(buttonVariants({ variant, size, className }))}
+      ref={ref}
+      {...props} />)
+  );
+})
+Button.displayName = "Button"
+
+export { Button, buttonVariants }
+import * as React from "react"
+import { ChevronLeft, ChevronRight } from "lucide-react"
+import { DayPicker } from "react-day-picker"
+
+import { cn } from "@/lib/utils"
+import { buttonVariants } from "@/components/ui/button"
+
+function Calendar({
+  className,
+  classNames,
+  showOutsideDays = true,
+  ...props
+}) {
+  return (
+    (<DayPicker
+      showOutsideDays={showOutsideDays}
+      className={cn("p-3", className)}
+      classNames={{
+        months: "flex flex-col sm:flex-row space-y-4 sm:space-x-4 sm:space-y-0",
+        month: "space-y-4",
+        caption: "flex justify-center pt-1 relative items-center",
+        caption_label: "text-sm font-medium",
+        nav: "space-x-1 flex items-center",
+        nav_button: cn(
+          buttonVariants({ variant: "outline" }),
+          "h-7 w-7 bg-transparent p-0 opacity-50 hover:opacity-100"
+        ),
+        nav_button_previous: "absolute left-1",
+        nav_button_next: "absolute right-1",
+        table: "w-full border-collapse space-y-1",
+        head_row: "flex",
+        head_cell:
+          "text-muted-foreground rounded-md w-8 font-normal text-[0.8rem]",
+        row: "flex w-full mt-2",
+        cell: cn(
+          "relative p-0 text-center text-sm focus-within:relative focus-within:z-20 [&:has([aria-selected])]:bg-accent [&:has([aria-selected].day-outside)]:bg-accent/50 [&:has([aria-selected].day-range-end)]:rounded-r-md",
+          props.mode === "range"
+            ? "[&:has(>.day-range-end)]:rounded-r-md [&:has(>.day-range-start)]:rounded-l-md first:[&:has([aria-selected])]:rounded-l-md last:[&:has([aria-selected])]:rounded-r-md"
+            : "[&:has([aria-selected])]:rounded-md"
+        ),
+        day: cn(
+          buttonVariants({ variant: "ghost" }),
+          "h-8 w-8 p-0 font-normal aria-selected:opacity-100"
+        ),
+        day_range_start: "day-range-start",
+        day_range_end: "day-range-end",
+        day_selected:
+          "bg-primary text-primary-foreground hover:bg-primary hover:text-primary-foreground focus:bg-primary focus:text-primary-foreground",
+        day_today: "bg-accent text-accent-foreground",
+        day_outside:
+          "day-outside text-muted-foreground aria-selected:bg-accent/50 aria-selected:text-muted-foreground",
+        day_disabled: "text-muted-foreground opacity-50",
+        day_range_middle:
+          "aria-selected:bg-accent aria-selected:text-accent-foreground",
+        day_hidden: "invisible",
+        ...classNames,
+      }}
+      components={{
+        IconLeft: ({ className, ...props }) => (
+          <ChevronLeft className={cn("h-4 w-4", className)} {...props} />
+        ),
+        IconRight: ({ className, ...props }) => (
+          <ChevronRight className={cn("h-4 w-4", className)} {...props} />
+        ),
+      }}
+      {...props} />)
+  );
+}
+Calendar.displayName = "Calendar"
+
+export { Calendar }
+import * as React from "react"
+
+import { cn } from "@/lib/utils"
+
+const Card = React.forwardRef(({ className, ...props }, ref) => (
+  <div
+    ref={ref}
+    className={cn("rounded-xl border bg-card text-card-foreground shadow", className)}
+    {...props} />
+))
+Card.displayName = "Card"
+
+const CardHeader = React.forwardRef(({ className, ...props }, ref) => (
+  <div
+    ref={ref}
+    className={cn("flex flex-col space-y-1.5 p-6", className)}
+    {...props} />
+))
+CardHeader.displayName = "CardHeader"
+
+const CardTitle = React.forwardRef(({ className, ...props }, ref) => (
+  <div
+    ref={ref}
+    className={cn("font-semibold leading-none tracking-tight", className)}
+    {...props} />
+))
+CardTitle.displayName = "CardTitle"
+
+const CardDescription = React.forwardRef(({ className, ...props }, ref) => (
+  <div
+    ref={ref}
+    className={cn("text-sm text-muted-foreground", className)}
+    {...props} />
+))
+CardDescription.displayName = "CardDescription"
+
+const CardContent = React.forwardRef(({ className, ...props }, ref) => (
+  <div ref={ref} className={cn("p-6 pt-0", className)} {...props} />
+))
+CardContent.displayName = "CardContent"
+
+const CardFooter = React.forwardRef(({ className, ...props }, ref) => (
+  <div
+    ref={ref}
+    className={cn("flex items-center p-6 pt-0", className)}
+    {...props} />
+))
+CardFooter.displayName = "CardFooter"
+
+export { Card, CardHeader, CardFooter, CardTitle, CardDescription, CardContent }
+import * as React from "react"
+import useEmblaCarousel from "embla-carousel-react";
+import { ArrowLeft, ArrowRight } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+import { Button } from "@/components/ui/button"
+
+const CarouselContext = React.createContext(null)
+
+function useCarousel() {
+  const context = React.useContext(CarouselContext)
+
+  if (!context) {
+    throw new Error("useCarousel must be used within a <Carousel />")
+  }
+
+  return context
+}
+
+const Carousel = React.forwardRef((
+  {
+    orientation = "horizontal",
+    opts,
+    setApi,
+    plugins,
+    className,
+    children,
+    ...props
+  },
+  ref
+) => {
+  const [carouselRef, api] = useEmblaCarousel({
+    ...opts,
+    axis: orientation === "horizontal" ? "x" : "y",
+  }, plugins)
+  const [canScrollPrev, setCanScrollPrev] = React.useState(false)
+  const [canScrollNext, setCanScrollNext] = React.useState(false)
+
+  const onSelect = React.useCallback((api) => {
+    if (!api) {
+      return
+    }
+
+    setCanScrollPrev(api.canScrollPrev())
+    setCanScrollNext(api.canScrollNext())
+  }, [])
+
+  const scrollPrev = React.useCallback(() => {
+    api?.scrollPrev()
+  }, [api])
+
+  const scrollNext = React.useCallback(() => {
+    api?.scrollNext()
+  }, [api])
+
+  const handleKeyDown = React.useCallback((event) => {
+    if (event.key === "ArrowLeft") {
+      event.preventDefault()
+      scrollPrev()
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault()
+      scrollNext()
+    }
+  }, [scrollPrev, scrollNext])
+
+  React.useEffect(() => {
+    if (!api || !setApi) {
+      return
+    }
+
+    setApi(api)
+  }, [api, setApi])
+
+  React.useEffect(() => {
+    if (!api) {
+      return
+    }
+
+    onSelect(api)
+    api.on("reInit", onSelect)
+    api.on("select", onSelect)
+
+    return () => {
+      api?.off("select", onSelect)
+    };
+  }, [api, onSelect])
+
+  return (
+    (<CarouselContext.Provider
+      value={{
+        carouselRef,
+        api: api,
+        opts,
+        orientation:
+          orientation || (opts?.axis === "y" ? "vertical" : "horizontal"),
+        scrollPrev,
+        scrollNext,
+        canScrollPrev,
+        canScrollNext,
+      }}>
+      <div
+        ref={ref}
+        onKeyDownCapture={handleKeyDown}
+        className={cn("relative", className)}
+        role="region"
+        aria-roledescription="carousel"
+        {...props}>
+        {children}
+      </div>
+    </CarouselContext.Provider>)
+  );
+})
+Carousel.displayName = "Carousel"
+
+const CarouselContent = React.forwardRef(({ className, ...props }, ref) => {
+  const { carouselRef, orientation } = useCarousel()
+
+  return (
+    (<div ref={carouselRef} className="overflow-hidden">
+      <div
+        ref={ref}
+        className={cn(
+          "flex",
+          orientation === "horizontal" ? "-ml-4" : "-mt-4 flex-col",
+          className
+        )}
+        {...props} />
+    </div>)
+  );
+})
+CarouselContent.displayName = "CarouselContent"
+
+const CarouselItem = React.forwardRef(({ className, ...props }, ref) => {
+  const { orientation } = useCarousel()
+
+  return (
+    (<div
+      ref={ref}
+      role="group"
+      aria-roledescription="slide"
+      className={cn(
+        "min-w-0 shrink-0 grow-0 basis-full",
+        orientation === "horizontal" ? "pl-4" : "pt-4",
+        className
+      )}
+      {...props} />)
+  );
+})
+CarouselItem.displayName = "CarouselItem"
+
+const CarouselPrevious = React.forwardRef(({ className, variant = "outline", size = "icon", ...props }, ref) => {
+  const { orientation, scrollPrev, canScrollPrev } = useCarousel()
+
+  return (
+    (<Button
+      ref={ref}
+      variant={variant}
+      size={size}
+      className={cn("absolute  h-8 w-8 rounded-full", orientation === "horizontal"
+        ? "-left-12 top-1/2 -translate-y-1/2"
+        : "-top-12 left-1/2 -translate-x-1/2 rotate-90", className)}
+      disabled={!canScrollPrev}
+      onClick={scrollPrev}
+      {...props}>
+      <ArrowLeft className="h-4 w-4" />
+      <span className="sr-only">Previous slide</span>
+    </Button>)
+  );
+})
+CarouselPrevious.displayName = "CarouselPrevious"
+
+const CarouselNext = React.forwardRef(({ className, variant = "outline", size = "icon", ...props }, ref) => {
+  const { orientation, scrollNext, canScrollNext } = useCarousel()
+
+  return (
+    (<Button
+      ref={ref}
+      variant={variant}
+      size={size}
+      className={cn("absolute h-8 w-8 rounded-full", orientation === "horizontal"
+        ? "-right-12 top-1/2 -translate-y-1/2"
+        : "-bottom-12 left-1/2 -translate-x-1/2 rotate-90", className)}
+      disabled={!canScrollNext}
+      onClick={scrollNext}
+      {...props}>
+      <ArrowRight className="h-4 w-4" />
+      <span className="sr-only">Next slide</span>
+    </Button>)
+  );
+})
+CarouselNext.displayName = "CarouselNext"
+
+export { Carousel, CarouselContent, CarouselItem, CarouselPrevious, CarouselNext };
+"use client";
+import * as React from "react"
+import * as RechartsPrimitive from "recharts"
+
+import { cn } from "@/lib/utils"
+
+// Format: { THEME_NAME: CSS_SELECTOR }
+const THEMES = {
+  light: "",
+  dark: ".dark"
+}
+
+const ChartContext = React.createContext(null)
+
+function useChart() {
+  const context = React.useContext(ChartContext)
+
+  if (!context) {
+    throw new Error("useChart must be used within a <ChartContainer />")
+  }
+
+  return context
+}
+
+const ChartContainer = React.forwardRef(({ id, className, children, config, ...props }, ref) => {
+  const uniqueId = React.useId()
+  const chartId = `chart-${id || uniqueId.replace(/:/g, "")}`
+
+  return (
+    (<ChartContext.Provider value={{ config }}>
+      <div
+        data-chart={chartId}
+        ref={ref}
+        className={cn(
+          "flex aspect-video justify-center text-xs [&_.recharts-cartesian-axis-tick_text]:fill-muted-foreground [&_.recharts-cartesian-grid_line[stroke='#ccc']]:stroke-border/50 [&_.recharts-curve.recharts-tooltip-cursor]:stroke-border [&_.recharts-dot[stroke='#fff']]:stroke-transparent [&_.recharts-layer]:outline-none [&_.recharts-polar-grid_[stroke='#ccc']]:stroke-border [&_.recharts-radial-bar-background-sector]:fill-muted [&_.recharts-rectangle.recharts-tooltip-cursor]:fill-muted [&_.recharts-reference-line_[stroke='#ccc']]:stroke-border [&_.recharts-sector[stroke='#fff']]:stroke-transparent [&_.recharts-sector]:outline-none [&_.recharts-surface]:outline-none",
+          className
+        )}
+        {...props}>
+        <ChartStyle id={chartId} config={config} />
+        <RechartsPrimitive.ResponsiveContainer>
+          {children}
+        </RechartsPrimitive.ResponsiveContainer>
+      </div>
+    </ChartContext.Provider>)
+  );
+})
+ChartContainer.displayName = "Chart"
+
+const ChartStyle = ({
+  id,
+  config
+}) => {
+  const colorConfig = Object.entries(config).filter(([, config]) => config.theme || config.color)
+
+  if (!colorConfig.length) {
+    return null
+  }
+
+  return (
+    (<style
+      dangerouslySetInnerHTML={{
+        __html: Object.entries(THEMES)
+          .map(([theme, prefix]) => `
+${prefix} [data-chart=${id}] {
+${colorConfig
+.map(([key, itemConfig]) => {
+const color =
+  itemConfig.theme?.[theme] ||
+  itemConfig.color
+return color ? `  --color-${key}: ${color};` : null
+})
+.join("\n")}
+}
+`)
+          .join("\n"),
+      }} />)
+  );
+}
+
+const ChartTooltip = RechartsPrimitive.Tooltip
+
+const ChartTooltipContent = React.forwardRef((
+  {
+    active,
+    payload,
+    className,
+    indicator = "dot",
+    hideLabel = false,
+    hideIndicator = false,
+    label,
+    labelFormatter,
+    labelClassName,
+    formatter,
+    color,
+    nameKey,
+    labelKey,
+  },
+  ref
+) => {
+  const { config } = useChart()
+
+  const tooltipLabel = React.useMemo(() => {
+    if (hideLabel || !payload?.length) {
+      return null
+    }
+
+    const [item] = payload
+    const key = `${labelKey || item.dataKey || item.name || "value"}`
+    const itemConfig = getPayloadConfigFromPayload(config, item, key)
+    const value =
+      !labelKey && typeof label === "string"
+        ? config[label]?.label || label
+        : itemConfig?.label
+
+    if (labelFormatter) {
+      return (
+        (<div className={cn("font-medium", labelClassName)}>
+          {labelFormatter(value, payload)}
+        </div>)
+      );
+    }
+
+    if (!value) {
+      return null
+    }
+
+    return <div className={cn("font-medium", labelClassName)}>{value}</div>;
+  }, [
+    label,
+    labelFormatter,
+    payload,
+    hideLabel,
+    labelClassName,
+    config,
+    labelKey,
+  ])
+
+  if (!active || !payload?.length) {
+    return null
+  }
+
+  const nestLabel = payload.length === 1 && indicator !== "dot"
+
+  return (
+    (<div
+      ref={ref}
+      className={cn(
+        "grid min-w-[8rem] items-start gap-1.5 rounded-lg border border-border/50 bg-background px-2.5 py-1.5 text-xs shadow-xl",
+        className
+      )}>
+      {!nestLabel ? tooltipLabel : null}
+      <div className="grid gap-1.5">
+        {payload.map((item, index) => {
+          const key = `${nameKey || item.name || item.dataKey || "value"}`
+          const itemConfig = getPayloadConfigFromPayload(config, item, key)
+          const indicatorColor = color || item.payload.fill || item.color
+
+          return (
+            (<div
+              key={item.dataKey}
+              className={cn(
+                "flex w-full flex-wrap items-stretch gap-2 [&>svg]:h-2.5 [&>svg]:w-2.5 [&>svg]:text-muted-foreground",
+                indicator === "dot" && "items-center"
+              )}>
+              {formatter && item?.value !== undefined && item.name ? (
+                formatter(item.value, item.name, item, index, item.payload)
+              ) : (
+                <>
+                  {itemConfig?.icon ? (
+                    <itemConfig.icon />
+                  ) : (
+                    !hideIndicator && (
+                      <div
+                        className={cn("shrink-0 rounded-[2px] border-[--color-border] bg-[--color-bg]", {
+                          "h-2.5 w-2.5": indicator === "dot",
+                          "w-1": indicator === "line",
+                          "w-0 border-[1.5px] border-dashed bg-transparent":
+                            indicator === "dashed",
+                          "my-0.5": nestLabel && indicator === "dashed",
+                        })}
+                        style={
+                          {
+                            "--color-bg": indicatorColor,
+                            "--color-border": indicatorColor
+                          }
+                        } />
+                    )
+                  )}
+                  <div
+                    className={cn(
+                      "flex flex-1 justify-between leading-none",
+                      nestLabel ? "items-end" : "items-center"
+                    )}>
+                    <div className="grid gap-1.5">
+                      {nestLabel ? tooltipLabel : null}
+                      <span className="text-muted-foreground">
+                        {itemConfig?.label || item.name}
+                      </span>
+                    </div>
+                    {item.value && (
+                      <span className="font-mono font-medium tabular-nums text-foreground">
+                        {item.value.toLocaleString()}
+                      </span>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>)
+          );
+        })}
+      </div>
+    </div>)
+  );
+})
+ChartTooltipContent.displayName = "ChartTooltip"
+
+const ChartLegend = RechartsPrimitive.Legend
+
+const ChartLegendContent = React.forwardRef((
+  { className, hideIcon = false, payload, verticalAlign = "bottom", nameKey },
+  ref
+) => {
+  const { config } = useChart()
+
+  if (!payload?.length) {
+    return null
+  }
+
+  return (
+    (<div
+      ref={ref}
+      className={cn(
+        "flex items-center justify-center gap-4",
+        verticalAlign === "top" ? "pb-3" : "pt-3",
+        className
+      )}>
+      {payload.map((item) => {
+        const key = `${nameKey || item.dataKey || "value"}`
+        const itemConfig = getPayloadConfigFromPayload(config, item, key)
+
+        return (
+          (<div
+            key={item.value}
+            className={cn(
+              "flex items-center gap-1.5 [&>svg]:h-3 [&>svg]:w-3 [&>svg]:text-muted-foreground"
+            )}>
+            {itemConfig?.icon && !hideIcon ? (
+              <itemConfig.icon />
+            ) : (
+              <div
+                className="h-2 w-2 shrink-0 rounded-[2px]"
+                style={{
+                  backgroundColor: item.color,
+                }} />
+            )}
+            {itemConfig?.label}
+          </div>)
+        );
+      })}
+    </div>)
+  );
+})
+ChartLegendContent.displayName = "ChartLegend"
+
+// Helper to extract item config from a payload.
+function getPayloadConfigFromPayload(
+  config,
+  payload,
+  key
+) {
+  if (typeof payload !== "object" || payload === null) {
+    return undefined
+  }
+
+  const payloadPayload =
+    "payload" in payload &&
+    typeof payload.payload === "object" &&
+    payload.payload !== null
+      ? payload.payload
+      : undefined
+
+  let configLabelKey = key
+
+  if (
+    key in payload &&
+    typeof payload[key] === "string"
+  ) {
+    configLabelKey = payload[key]
+  } else if (
+    payloadPayload &&
+    key in payloadPayload &&
+    typeof payloadPayload[key] === "string"
+  ) {
+    configLabelKey = payloadPayload[key]
+  }
+
+  return configLabelKey in config
+    ? config[configLabelKey]
+    : config[key];
+}
+
+export {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+  ChartLegend,
+  ChartLegendContent,
+  ChartStyle,
+}
+import * as React from "react"
+import * as CheckboxPrimitive from "@radix-ui/react-checkbox"
+import { Check } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+
+const Checkbox = React.forwardRef(({ className, ...props }, ref) => (
+  <CheckboxPrimitive.Root
+    ref={ref}
+    className={cn(
+      "peer h-4 w-4 shrink-0 rounded-sm border border-primary shadow focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 data-[state=checked]:bg-primary data-[state=checked]:text-primary-foreground",
+      className
+    )}
+    {...props}>
+    <CheckboxPrimitive.Indicator className={cn("flex items-center justify-center text-current")}>
+      <Check className="h-4 w-4" />
+    </CheckboxPrimitive.Indicator>
+  </CheckboxPrimitive.Root>
+))
+Checkbox.displayName = CheckboxPrimitive.Root.displayName
+
+export { Checkbox }
+"use client"
+
+import * as CollapsiblePrimitive from "@radix-ui/react-collapsible"
+
+const Collapsible = CollapsiblePrimitive.Root
+
+const CollapsibleTrigger = CollapsiblePrimitive.CollapsibleTrigger
+
+const CollapsibleContent = CollapsiblePrimitive.CollapsibleContent
+
+export { Collapsible, CollapsibleTrigger, CollapsibleContent }
+import * as React from "react"
+import { Command as CommandPrimitive } from "cmdk"
+import { Search } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+import { Dialog, DialogContent } from "@/components/ui/dialog"
+
+const Command = React.forwardRef(({ className, ...props }, ref) => (
+  <CommandPrimitive
+    ref={ref}
+    className={cn(
+      "flex h-full w-full flex-col overflow-hidden rounded-md bg-popover text-popover-foreground",
+      className
+    )}
+    {...props} />
+))
+Command.displayName = CommandPrimitive.displayName
+
+const CommandDialog = ({
+  children,
+  ...props
+}) => {
+  return (
+    (<Dialog {...props}>
+      <DialogContent className="overflow-hidden p-0">
+        <Command
+          className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground [&_[cmdk-group]:not([hidden])_~[cmdk-group]]:pt-0 [&_[cmdk-group]]:px-2 [&_[cmdk-input-wrapper]_svg]:h-5 [&_[cmdk-input-wrapper]_svg]:w-5 [&_[cmdk-input]]:h-12 [&_[cmdk-item]]:px-2 [&_[cmdk-item]]:py-3 [&_[cmdk-item]_svg]:h-5 [&_[cmdk-item]_svg]:w-5">
+          {children}
+        </Command>
+      </DialogContent>
+    </Dialog>)
+  );
+}
+
+const CommandInput = React.forwardRef(({ className, ...props }, ref) => (
+  <div className="flex items-center border-b px-3" cmdk-input-wrapper="">
+    <Search className="mr-2 h-4 w-4 shrink-0 opacity-50" />
+    <CommandPrimitive.Input
+      ref={ref}
+      className={cn(
+        "flex h-10 w-full rounded-md bg-transparent py-3 text-sm outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50",
+        className
+      )}
+      {...props} />
+  </div>
+))
+
+CommandInput.displayName = CommandPrimitive.Input.displayName
+
+const CommandList = React.forwardRef(({ className, ...props }, ref) => (
+  <CommandPrimitive.List
+    ref={ref}
+    className={cn("max-h-[300px] overflow-y-auto overflow-x-hidden", className)}
+    {...props} />
+))
+
+CommandList.displayName = CommandPrimitive.List.displayName
+
+const CommandEmpty = React.forwardRef((props, ref) => (
+  <CommandPrimitive.Empty ref={ref} className="py-6 text-center text-sm" {...props} />
+))
+
+CommandEmpty.displayName = CommandPrimitive.Empty.displayName
+
+const CommandGroup = React.forwardRef(({ className, ...props }, ref) => (
+  <CommandPrimitive.Group
+    ref={ref}
+    className={cn(
+      "overflow-hidden p-1 text-foreground [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground",
+      className
+    )}
+    {...props} />
+))
+
+CommandGroup.displayName = CommandPrimitive.Group.displayName
+
+const CommandSeparator = React.forwardRef(({ className, ...props }, ref) => (
+  <CommandPrimitive.Separator ref={ref} className={cn("-mx-1 h-px bg-border", className)} {...props} />
+))
+CommandSeparator.displayName = CommandPrimitive.Separator.displayName
+
+const CommandItem = React.forwardRef(({ className, ...props }, ref) => (
+  <CommandPrimitive.Item
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default gap-2 select-none items-center rounded-sm px-2 py-1.5 text-sm outline-none data-[disabled=true]:pointer-events-none data-[selected=true]:bg-accent data-[selected=true]:text-accent-foreground data-[disabled=true]:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+      className
+    )}
+    {...props} />
+))
+
+CommandItem.displayName = CommandPrimitive.Item.displayName
+
+const CommandShortcut = ({
+  className,
+  ...props
+}) => {
+  return (
+    (<span
+      className={cn("ml-auto text-xs tracking-widest text-muted-foreground", className)}
+      {...props} />)
+  );
+}
+CommandShortcut.displayName = "CommandShortcut"
+
+export {
+  Command,
+  CommandDialog,
+  CommandInput,
+  CommandList,
+  CommandEmpty,
+  CommandGroup,
+  CommandItem,
+  CommandShortcut,
+  CommandSeparator,
+}
+import * as React from "react"
+import * as ContextMenuPrimitive from "@radix-ui/react-context-menu"
+import { Check, ChevronRight, Circle } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+
+const ContextMenu = ContextMenuPrimitive.Root
+
+const ContextMenuTrigger = ContextMenuPrimitive.Trigger
+
+const ContextMenuGroup = ContextMenuPrimitive.Group
+
+const ContextMenuPortal = ContextMenuPrimitive.Portal
+
+const ContextMenuSub = ContextMenuPrimitive.Sub
+
+const ContextMenuRadioGroup = ContextMenuPrimitive.RadioGroup
+
+const ContextMenuSubTrigger = React.forwardRef(({ className, inset, children, ...props }, ref) => (
+  <ContextMenuPrimitive.SubTrigger
+    ref={ref}
+    className={cn(
+      "flex cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[state=open]:bg-accent data-[state=open]:text-accent-foreground",
+      inset && "pl-8",
+      className
+    )}
+    {...props}>
+    {children}
+    <ChevronRight className="ml-auto h-4 w-4" />
+  </ContextMenuPrimitive.SubTrigger>
+))
+ContextMenuSubTrigger.displayName = ContextMenuPrimitive.SubTrigger.displayName
+
+const ContextMenuSubContent = React.forwardRef(({ className, ...props }, ref) => (
+  <ContextMenuPrimitive.SubContent
+    ref={ref}
+    className={cn(
+      "z-50 min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+      className
+    )}
+    {...props} />
+))
+ContextMenuSubContent.displayName = ContextMenuPrimitive.SubContent.displayName
+
+const ContextMenuContent = React.forwardRef(({ className, ...props }, ref) => (
+  <ContextMenuPrimitive.Portal>
+    <ContextMenuPrimitive.Content
+      ref={ref}
+      className={cn(
+        "z-50 min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+        className
+      )}
+      {...props} />
+  </ContextMenuPrimitive.Portal>
+))
+ContextMenuContent.displayName = ContextMenuPrimitive.Content.displayName
+
+const ContextMenuItem = React.forwardRef(({ className, inset, ...props }, ref) => (
+  <ContextMenuPrimitive.Item
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      inset && "pl-8",
+      className
+    )}
+    {...props} />
+))
+ContextMenuItem.displayName = ContextMenuPrimitive.Item.displayName
+
+const ContextMenuCheckboxItem = React.forwardRef(({ className, children, checked, ...props }, ref) => (
+  <ContextMenuPrimitive.CheckboxItem
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      className
+    )}
+    checked={checked}
+    {...props}>
+    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+      <ContextMenuPrimitive.ItemIndicator>
+        <Check className="h-4 w-4" />
+      </ContextMenuPrimitive.ItemIndicator>
+    </span>
+    {children}
+  </ContextMenuPrimitive.CheckboxItem>
+))
+ContextMenuCheckboxItem.displayName =
+  ContextMenuPrimitive.CheckboxItem.displayName
+
+const ContextMenuRadioItem = React.forwardRef(({ className, children, ...props }, ref) => (
+  <ContextMenuPrimitive.RadioItem
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      className
+    )}
+    {...props}>
+    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+      <ContextMenuPrimitive.ItemIndicator>
+        <Circle className="h-4 w-4 fill-current" />
+      </ContextMenuPrimitive.ItemIndicator>
+    </span>
+    {children}
+  </ContextMenuPrimitive.RadioItem>
+))
+ContextMenuRadioItem.displayName = ContextMenuPrimitive.RadioItem.displayName
+
+const ContextMenuLabel = React.forwardRef(({ className, inset, ...props }, ref) => (
+  <ContextMenuPrimitive.Label
+    ref={ref}
+    className={cn(
+      "px-2 py-1.5 text-sm font-semibold text-foreground",
+      inset && "pl-8",
+      className
+    )}
+    {...props} />
+))
+ContextMenuLabel.displayName = ContextMenuPrimitive.Label.displayName
+
+const ContextMenuSeparator = React.forwardRef(({ className, ...props }, ref) => (
+  <ContextMenuPrimitive.Separator
+    ref={ref}
+    className={cn("-mx-1 my-1 h-px bg-border", className)}
+    {...props} />
+))
+ContextMenuSeparator.displayName = ContextMenuPrimitive.Separator.displayName
+
+const ContextMenuShortcut = ({
+  className,
+  ...props
+}) => {
+  return (
+    (<span
+      className={cn("ml-auto text-xs tracking-widest text-muted-foreground", className)}
+      {...props} />)
+  );
+}
+ContextMenuShortcut.displayName = "ContextMenuShortcut"
+
+export {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuCheckboxItem,
+  ContextMenuRadioItem,
+  ContextMenuLabel,
+  ContextMenuSeparator,
+  ContextMenuShortcut,
+  ContextMenuGroup,
+  ContextMenuPortal,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
+  ContextMenuRadioGroup,
+}
+"use client"
+
+import * as React from "react"
+import * as DialogPrimitive from "@radix-ui/react-dialog"
+import { X } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+
+const Dialog = DialogPrimitive.Root
+
+const DialogTrigger = DialogPrimitive.Trigger
+
+const DialogPortal = DialogPrimitive.Portal
+
+const DialogClose = DialogPrimitive.Close
+
+const DialogOverlay = React.forwardRef(({ className, ...props }, ref) => (
+  <DialogPrimitive.Overlay
+    ref={ref}
+    className={cn(
+      "fixed inset-0 z-50 bg-black/80  data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+      className
+    )}
+    {...props} />
+))
+DialogOverlay.displayName = DialogPrimitive.Overlay.displayName
+
+const DialogContent = React.forwardRef(({ className, children, ...props }, ref) => (
+  <DialogPortal>
+    <DialogOverlay />
+    <DialogPrimitive.Content
+      ref={ref}
+      className={cn(
+        "fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 border bg-background p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] sm:rounded-lg",
+        className
+      )}
+      {...props}>
+      {children}
+      <DialogPrimitive.Close
+        className="absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-accent data-[state=open]:text-muted-foreground">
+        <X className="h-4 w-4" />
+        <span className="sr-only">Close</span>
+      </DialogPrimitive.Close>
+    </DialogPrimitive.Content>
+  </DialogPortal>
+))
+DialogContent.displayName = DialogPrimitive.Content.displayName
+
+const DialogHeader = ({
+  className,
+  ...props
+}) => (
+  <div
+    className={cn("flex flex-col space-y-1.5 text-center sm:text-left", className)}
+    {...props} />
+)
+DialogHeader.displayName = "DialogHeader"
+
+const DialogFooter = ({
+  className,
+  ...props
+}) => (
+  <div
+    className={cn("flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2", className)}
+    {...props} />
+)
+DialogFooter.displayName = "DialogFooter"
+
+const DialogTitle = React.forwardRef(({ className, ...props }, ref) => (
+  <DialogPrimitive.Title
+    ref={ref}
+    className={cn("text-lg font-semibold leading-none tracking-tight", className)}
+    {...props} />
+))
+DialogTitle.displayName = DialogPrimitive.Title.displayName
+
+const DialogDescription = React.forwardRef(({ className, ...props }, ref) => (
+  <DialogPrimitive.Description
+    ref={ref}
+    className={cn("text-sm text-muted-foreground", className)}
+    {...props} />
+))
+DialogDescription.displayName = DialogPrimitive.Description.displayName
+
+export {
+  Dialog,
+  DialogPortal,
+  DialogOverlay,
+  DialogTrigger,
+  DialogClose,
+  DialogContent,
+  DialogHeader,
+  DialogFooter,
+  DialogTitle,
+  DialogDescription,
+}
+"use client"
+
+import * as React from "react"
+import { Drawer as DrawerPrimitive } from "vaul"
+
+import { cn } from "@/lib/utils"
+
+const Drawer = ({
+  shouldScaleBackground = true,
+  ...props
+}) => (
+  <DrawerPrimitive.Root shouldScaleBackground={shouldScaleBackground} {...props} />
+)
+Drawer.displayName = "Drawer"
+
+const DrawerTrigger = DrawerPrimitive.Trigger
+
+const DrawerPortal = DrawerPrimitive.Portal
+
+const DrawerClose = DrawerPrimitive.Close
+
+const DrawerOverlay = React.forwardRef(({ className, ...props }, ref) => (
+  <DrawerPrimitive.Overlay
+    ref={ref}
+    className={cn("fixed inset-0 z-50 bg-black/80", className)}
+    {...props} />
+))
+DrawerOverlay.displayName = DrawerPrimitive.Overlay.displayName
+
+const DrawerContent = React.forwardRef(({ className, children, ...props }, ref) => (
+  <DrawerPortal>
+    <DrawerOverlay />
+    <DrawerPrimitive.Content
+      ref={ref}
+      className={cn(
+        "fixed inset-x-0 bottom-0 z-50 mt-24 flex h-auto flex-col rounded-t-[10px] border bg-background",
+        className
+      )}
+      {...props}>
+      <div className="mx-auto mt-4 h-2 w-[100px] rounded-full bg-muted" />
+      {children}
+    </DrawerPrimitive.Content>
+  </DrawerPortal>
+))
+DrawerContent.displayName = "DrawerContent"
+
+const DrawerHeader = ({
+  className,
+  ...props
+}) => (
+  <div
+    className={cn("grid gap-1.5 p-4 text-center sm:text-left", className)}
+    {...props} />
+)
+DrawerHeader.displayName = "DrawerHeader"
+
+const DrawerFooter = ({
+  className,
+  ...props
+}) => (
+  <div className={cn("mt-auto flex flex-col gap-2 p-4", className)} {...props} />
+)
+DrawerFooter.displayName = "DrawerFooter"
+
+const DrawerTitle = React.forwardRef(({ className, ...props }, ref) => (
+  <DrawerPrimitive.Title
+    ref={ref}
+    className={cn("text-lg font-semibold leading-none tracking-tight", className)}
+    {...props} />
+))
+DrawerTitle.displayName = DrawerPrimitive.Title.displayName
+
+const DrawerDescription = React.forwardRef(({ className, ...props }, ref) => (
+  <DrawerPrimitive.Description
+    ref={ref}
+    className={cn("text-sm text-muted-foreground", className)}
+    {...props} />
+))
+DrawerDescription.displayName = DrawerPrimitive.Description.displayName
+
+export {
+  Drawer,
+  DrawerPortal,
+  DrawerOverlay,
+  DrawerTrigger,
+  DrawerClose,
+  DrawerContent,
+  DrawerHeader,
+  DrawerFooter,
+  DrawerTitle,
+  DrawerDescription,
+}
+import * as React from "react"
+import * as DropdownMenuPrimitive from "@radix-ui/react-dropdown-menu"
+import { Check, ChevronRight, Circle } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+
+const DropdownMenu = DropdownMenuPrimitive.Root
+
+const DropdownMenuTrigger = DropdownMenuPrimitive.Trigger
+
+const DropdownMenuGroup = DropdownMenuPrimitive.Group
+
+const DropdownMenuPortal = DropdownMenuPrimitive.Portal
+
+const DropdownMenuSub = DropdownMenuPrimitive.Sub
+
+const DropdownMenuRadioGroup = DropdownMenuPrimitive.RadioGroup
+
+const DropdownMenuSubTrigger = React.forwardRef(({ className, inset, children, ...props }, ref) => (
+  <DropdownMenuPrimitive.SubTrigger
+    ref={ref}
+    className={cn(
+      "flex cursor-default gap-2 select-none items-center rounded-sm px-2 py-1.5 text-sm outline-none focus:bg-accent data-[state=open]:bg-accent [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+      inset && "pl-8",
+      className
+    )}
+    {...props}>
+    {children}
+    <ChevronRight className="ml-auto" />
+  </DropdownMenuPrimitive.SubTrigger>
+))
+DropdownMenuSubTrigger.displayName =
+  DropdownMenuPrimitive.SubTrigger.displayName
+
+const DropdownMenuSubContent = React.forwardRef(({ className, ...props }, ref) => (
+  <DropdownMenuPrimitive.SubContent
+    ref={ref}
+    className={cn(
+      "z-50 min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+      className
+    )}
+    {...props} />
+))
+DropdownMenuSubContent.displayName =
+  DropdownMenuPrimitive.SubContent.displayName
+
+const DropdownMenuContent = React.forwardRef(({ className, sideOffset = 4, ...props }, ref) => (
+  <DropdownMenuPrimitive.Portal>
+    <DropdownMenuPrimitive.Content
+      ref={ref}
+      sideOffset={sideOffset}
+      className={cn(
+        "z-50 min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md",
+        "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+        className
+      )}
+      {...props} />
+  </DropdownMenuPrimitive.Portal>
+))
+DropdownMenuContent.displayName = DropdownMenuPrimitive.Content.displayName
+
+const DropdownMenuItem = React.forwardRef(({ className, inset, ...props }, ref) => (
+  <DropdownMenuPrimitive.Item
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-none transition-colors focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&>svg]:size-4 [&>svg]:shrink-0",
+      inset && "pl-8",
+      className
+    )}
+    {...props} />
+))
+DropdownMenuItem.displayName = DropdownMenuPrimitive.Item.displayName
+
+const DropdownMenuCheckboxItem = React.forwardRef(({ className, children, checked, ...props }, ref) => (
+  <DropdownMenuPrimitive.CheckboxItem
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none transition-colors focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      className
+    )}
+    checked={checked}
+    {...props}>
+    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+      <DropdownMenuPrimitive.ItemIndicator>
+        <Check className="h-4 w-4" />
+      </DropdownMenuPrimitive.ItemIndicator>
+    </span>
+    {children}
+  </DropdownMenuPrimitive.CheckboxItem>
+))
+DropdownMenuCheckboxItem.displayName =
+  DropdownMenuPrimitive.CheckboxItem.displayName
+
+const DropdownMenuRadioItem = React.forwardRef(({ className, children, ...props }, ref) => (
+  <DropdownMenuPrimitive.RadioItem
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none transition-colors focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      className
+    )}
+    {...props}>
+    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+      <DropdownMenuPrimitive.ItemIndicator>
+        <Circle className="h-2 w-2 fill-current" />
+      </DropdownMenuPrimitive.ItemIndicator>
+    </span>
+    {children}
+  </DropdownMenuPrimitive.RadioItem>
+))
+DropdownMenuRadioItem.displayName = DropdownMenuPrimitive.RadioItem.displayName
+
+const DropdownMenuLabel = React.forwardRef(({ className, inset, ...props }, ref) => (
+  <DropdownMenuPrimitive.Label
+    ref={ref}
+    className={cn("px-2 py-1.5 text-sm font-semibold", inset && "pl-8", className)}
+    {...props} />
+))
+DropdownMenuLabel.displayName = DropdownMenuPrimitive.Label.displayName
+
+const DropdownMenuSeparator = React.forwardRef(({ className, ...props }, ref) => (
+  <DropdownMenuPrimitive.Separator
+    ref={ref}
+    className={cn("-mx-1 my-1 h-px bg-muted", className)}
+    {...props} />
+))
+DropdownMenuSeparator.displayName = DropdownMenuPrimitive.Separator.displayName
+
+const DropdownMenuShortcut = ({
+  className,
+  ...props
+}) => {
+  return (
+    (<span
+      className={cn("ml-auto text-xs tracking-widest opacity-60", className)}
+      {...props} />)
+  );
+}
+DropdownMenuShortcut.displayName = "DropdownMenuShortcut"
+
+export {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuCheckboxItem,
+  DropdownMenuRadioItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+  DropdownMenuGroup,
+  DropdownMenuPortal,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuRadioGroup,
+}
+"use client";
+import * as React from "react"
+import { Slot } from "@radix-ui/react-slot"
+import { Controller, FormProvider, useFormContext } from "react-hook-form";
+
+import { cn } from "@/lib/utils"
+import { Label } from "@/components/ui/label"
+
+const Form = FormProvider
+
+const FormFieldContext = React.createContext({})
+
+const FormField = (
+  {
+    ...props
+  }
+) => {
+  return (
+    (<FormFieldContext.Provider value={{ name: props.name }}>
+      <Controller {...props} />
+    </FormFieldContext.Provider>)
+  );
+}
+
+const useFormField = () => {
+  const fieldContext = React.useContext(FormFieldContext)
+  const itemContext = React.useContext(FormItemContext)
+  const { getFieldState, formState } = useFormContext()
+
+  const fieldState = getFieldState(fieldContext.name, formState)
+
+  if (!fieldContext) {
+    throw new Error("useFormField should be used within <FormField>")
+  }
+
+  const { id } = itemContext
+
+  return {
+    id,
+    name: fieldContext.name,
+    formItemId: `${id}-form-item`,
+    formDescriptionId: `${id}-form-item-description`,
+    formMessageId: `${id}-form-item-message`,
+    ...fieldState,
+  }
+}
+
+const FormItemContext = React.createContext({})
+
+const FormItem = React.forwardRef(({ className, ...props }, ref) => {
+  const id = React.useId()
+
+  return (
+    (<FormItemContext.Provider value={{ id }}>
+      <div ref={ref} className={cn("space-y-2", className)} {...props} />
+    </FormItemContext.Provider>)
+  );
+})
+FormItem.displayName = "FormItem"
+
+const FormLabel = React.forwardRef(({ className, ...props }, ref) => {
+  const { error, formItemId } = useFormField()
+
+  return (
+    (<Label
+      ref={ref}
+      className={cn(error && "text-destructive", className)}
+      htmlFor={formItemId}
+      {...props} />)
+  );
+})
+FormLabel.displayName = "FormLabel"
+
+const FormControl = React.forwardRef(({ ...props }, ref) => {
+  const { error, formItemId, formDescriptionId, formMessageId } = useFormField()
+
+  return (
+    (<Slot
+      ref={ref}
+      id={formItemId}
+      aria-describedby={
+        !error
+          ? `${formDescriptionId}`
+          : `${formDescriptionId} ${formMessageId}`
+      }
+      aria-invalid={!!error}
+      {...props} />)
+  );
+})
+FormControl.displayName = "FormControl"
+
+const FormDescription = React.forwardRef(({ className, ...props }, ref) => {
+  const { formDescriptionId } = useFormField()
+
+  return (
+    (<p
+      ref={ref}
+      id={formDescriptionId}
+      className={cn("text-[0.8rem] text-muted-foreground", className)}
+      {...props} />)
+  );
+})
+FormDescription.displayName = "FormDescription"
+
+const FormMessage = React.forwardRef(({ className, children, ...props }, ref) => {
+  const { error, formMessageId } = useFormField()
+  const body = error ? String(error?.message) : children
+
+  if (!body) {
+    return null
+  }
+
+  return (
+    (<p
+      ref={ref}
+      id={formMessageId}
+      className={cn("text-[0.8rem] font-medium text-destructive", className)}
+      {...props}>
+      {body}
+    </p>)
+  );
+})
+FormMessage.displayName = "FormMessage"
+
+export {
+  useFormField,
+  Form,
+  FormItem,
+  FormLabel,
+  FormControl,
+  FormDescription,
+  FormMessage,
+  FormField,
+}
+"use client"
+
+import * as React from "react"
+import * as HoverCardPrimitive from "@radix-ui/react-hover-card"
+
+import { cn } from "@/lib/utils"
+
+const HoverCard = HoverCardPrimitive.Root
+
+const HoverCardTrigger = HoverCardPrimitive.Trigger
+
+const HoverCardContent = React.forwardRef(({ className, align = "center", sideOffset = 4, ...props }, ref) => (
+  <HoverCardPrimitive.Content
+    ref={ref}
+    align={align}
+    sideOffset={sideOffset}
+    className={cn(
+      "z-50 w-64 rounded-md border bg-popover p-4 text-popover-foreground shadow-md outline-none data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+      className
+    )}
+    {...props} />
+))
+HoverCardContent.displayName = HoverCardPrimitive.Content.displayName
+
+export { HoverCard, HoverCardTrigger, HoverCardContent }
+const WIX_MEDIA_HOSTS = {
+  "media.base44.com": "/images/public/",
+  "static.wixstatic.com": "/media/",
+}
+
+export const DEFAULT_TRANSFORM_WIDTH = 1024
+export const IMAGE_LOAD_MODE = {
+  OPTIMIZED: "optimized",
+  ORIGINAL: "original",
+  FALLBACK: "fallback",
+}
+
+const DEVICE_PIXEL_RATIOS = [1, 2, 3]
+const MAX_DIMENSION = 6000
+
+export function splitImageProps(props) {
+  const wrapperProps = {}
+  const imageProps = {}
+  for (const [key, value] of Object.entries(props)) {
+    if (key.startsWith("data-")) wrapperProps[key] = value
+    else imageProps[key] = value
+  }
+  return { wrapperProps, imageProps }
+}
+
+export function getImagePreviewClassName(className, currentClassName, baselineClassName) {
+  const sourceClasses = new Set((className || "").split(/\s+/))
+  const baselineClasses = new Set(baselineClassName.split(/\s+/))
+  return currentClassName.split(/\s+/).filter((token) =>
+    !["inline-block", "relative"].includes(token) || !baselineClasses.has(token) || sourceClasses.has(token)
+  ).join(" ")
+}
+
+/** Returns transform metadata only for canonical public Wix image URLs. */
+export function parseWixMediaUrl(src) {
+  try {
+    const url = new URL(src)
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      (url.port && url.port !== "443")
+    ) {
+      return null
+    }
+
+    const pathPrefix = WIX_MEDIA_HOSTS[url.hostname]
+    if (!pathPrefix) return null
+
+    const transformed = url.pathname.match(/^(.*)\/v1\/(?:fill|fit)\/[^/]+\/[^/]+$/i)
+    const basePath = transformed ? transformed[1] : url.pathname
+    const filename = basePath.split("/").pop()
+    if (
+      !basePath.startsWith(pathPrefix) ||
+      !filename ||
+      !/\.[a-z0-9]+$/i.test(filename) ||
+      /\.svg$/i.test(filename)
+    ) {
+      return null
+    }
+
+    return { baseUrl: `${url.origin}${basePath}`, filename }
+  } catch {
+    return null
+  }
+}
+
+const clampDim = (n) => Math.min(Math.max(Math.round(n), 1), MAX_DIMENSION)
+const clamp01 = (n) => Math.min(1, Math.max(0, n))
+
+export function buildTransformUrl(
+  { baseUrl, filename },
+  { width, height, crop, focalPoint, quality }
+) {
+  const params = [`w_${clampDim(width)}`, `h_${clampDim(height || width)}`]
+  if (crop) {
+    params.push(
+      focalPoint
+        ? `fp_${clamp01(focalPoint.x).toFixed(2)}_${clamp01(focalPoint.y).toFixed(2)}`
+        : "al_c"
+    )
+  }
+  // Preserve GIF delivery; negotiate AVIF/WebP for other images via Accept.
+  const encoding = /\.gif$/i.test(filename) ? "enc_webp" : "enc_auto"
+  params.push(`q_${quality}`, "usm_0.66_1.00_0.01", encoding, "quality_auto")
+  return `${baseUrl}/v1/${crop ? "fill" : "fit"}/${params.join(",")}/${filename}`
+}
+
+export function buildSrcSet(parsed, options) {
+  return DEVICE_PIXEL_RATIOS.map(
+    (dpr) =>
+      `${buildTransformUrl(parsed, {
+        ...options,
+        width: options.width * dpr,
+        height: options.height ? options.height * dpr : undefined,
+      })} ${dpr}x`
+  ).join(", ")
+}
+
+export function getOriginalImageUrl(src, parsed) {
+  return parsed?.baseUrl || src
+}
+
+export function nextImageLoadMode(mode) {
+  return mode === IMAGE_LOAD_MODE.OPTIMIZED
+    ? IMAGE_LOAD_MODE.ORIGINAL
+    : IMAGE_LOAD_MODE.FALLBACK
+}
+import * as React from "react"
+import { ResponsiveImage } from "./responsive-image"
+import {
+  getOriginalImageUrl,
+  IMAGE_LOAD_MODE,
+  nextImageLoadMode,
+  parseWixMediaUrl,
+} from "./image-helpers"
+
+const FALLBACK_IMAGE_URL =
+  "https://static.wixstatic.com/media/12d367_4f26ccd17f8f4e3a8958306ea08c2332~mv2.png"
+
+/**
+ * Image with built-in Wix Media Platform support: canonical public images on
+ * media.base44.com and static.wixstatic.com/media are resized to the rendered
+ * container per device pixel ratio and served as AVIF/WebP when supported; `fittingType="fill"`
+ * crops server-side, optionally anchored at a focal point. Other URLs render
+ * as a plain <img>. Failed transforms retry the original URL; only a broken
+ * original swaps to the generic fallback image.
+ */
+const Image = React.forwardRef(
+  (
+    {
+      src: source,
+      fittingType = "fill",
+      originWidth,
+      originHeight,
+      focalPointX,
+      focalPointY,
+      quality = 90,
+      onError,
+      ...props
+    },
+    ref
+  ) => {
+    const [previewSource, setPreviewSource] = React.useState(null)
+    const preview = previewSource?.source === source ? previewSource : null
+    const src = preview ? preview.value : source
+    const replaceSource = (value, className) => setPreviewSource({
+      source, value, className, sourceClassName: props.className,
+    })
+    React.useEffect(() => setPreviewSource(null), [source])
+    const parsedSource = src && src !== FALLBACK_IMAGE_URL ? parseWixMediaUrl(src) : null
+    const initialMode = parsedSource ? IMAGE_LOAD_MODE.OPTIMIZED : IMAGE_LOAD_MODE.ORIGINAL
+    const [loadState, setLoadState] = React.useState({ src, mode: initialMode })
+    const mode = loadState.src === src ? loadState.mode : initialMode
+
+    React.useEffect(() => {
+      setLoadState({ src, mode: initialMode })
+    }, [src, initialMode])
+
+    const handleError = (event) => {
+      if (mode === IMAGE_LOAD_MODE.FALLBACK) return
+      const nextMode = nextImageLoadMode(mode)
+      setLoadState({ src, mode: nextMode })
+      if (nextMode === IMAGE_LOAD_MODE.FALLBACK) onError?.(event)
+    }
+
+    const imageProps = {
+      ...props,
+      className: preview && preview.sourceClassName === props.className ? preview.className : props.className,
+      onError: handleError,
+    }
+
+    if (!src) {
+      // Renders as a real <img> (not a <div>) — the visual editor's
+      // click-to-edit toolbar keys its "Replace Image" action off the DOM
+      // tag being `img`, so a placeholder div would be unrecoverable in the
+      // editor. FALLBACK_IMAGE_URL doubles as the "no image chosen" graphic.
+      return <img ref={ref} src={FALLBACK_IMAGE_URL} {...imageProps} data-empty-image />
+    }
+
+    // A failed transform retries the underlying original as a plain image.
+    // Only a failure of that original advances to the generic fallback.
+    const parsed = mode === IMAGE_LOAD_MODE.OPTIMIZED ? parsedSource : null
+
+    if (!parsed) {
+      const isErrorMode = mode === IMAGE_LOAD_MODE.FALLBACK
+      const imageSrc = isErrorMode ? FALLBACK_IMAGE_URL : getOriginalImageUrl(src, parsedSource)
+      return (
+        <img ref={ref} src={imageSrc} {...imageProps} data-error-image={isErrorMode || undefined} />
+      )
+    }
+
+    const focalPoint =
+      typeof focalPointX === "number" && typeof focalPointY === "number"
+        ? { x: focalPointX, y: focalPointY }
+        : undefined
+    // Origin dimensions are optional — when known they stabilize layout via
+    // the wrapper's aspect-ratio before the image loads.
+    const aspectRatio =
+      originWidth && originHeight ? `${originWidth} / ${originHeight}` : undefined
+
+    return (
+      <ResponsiveImage
+        ref={ref}
+        src={src}
+        parsed={parsed}
+        onSourceChange={replaceSource}
+        fittingType={fittingType}
+        focalPoint={focalPoint}
+        quality={quality}
+        aspectRatio={aspectRatio}
+        {...imageProps}
+      />
+    )
+  }
+)
+Image.displayName = "Image"
+
+export { Image }
+import * as React from "react"
+import { OTPInput, OTPInputContext } from "input-otp"
+import { Minus } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+
+const InputOTP = React.forwardRef(({ className, containerClassName, ...props }, ref) => (
+  <OTPInput
+    ref={ref}
+    containerClassName={cn("flex items-center gap-2 has-[:disabled]:opacity-50", containerClassName)}
+    className={cn("disabled:cursor-not-allowed", className)}
+    {...props} />
+))
+InputOTP.displayName = "InputOTP"
+
+const InputOTPGroup = React.forwardRef(({ className, ...props }, ref) => (
+  <div ref={ref} className={cn("flex items-center", className)} {...props} />
+))
+InputOTPGroup.displayName = "InputOTPGroup"
+
+const InputOTPSlot = React.forwardRef(({ index, className, ...props }, ref) => {
+  const inputOTPContext = React.useContext(OTPInputContext)
+  const { char, hasFakeCaret, isActive } = inputOTPContext.slots[index]
+
+  return (
+    (<div
+      ref={ref}
+      className={cn(
+        "relative flex h-9 w-9 items-center justify-center border-y border-r border-input text-sm shadow-sm transition-all first:rounded-l-md first:border-l last:rounded-r-md",
+        isActive && "z-10 ring-1 ring-ring",
+        className
+      )}
+      {...props}>
+      {char}
+      {hasFakeCaret && (
+        <div
+          className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <div className="h-4 w-px animate-caret-blink bg-foreground duration-1000" />
+        </div>
+      )}
+    </div>)
+  );
+})
+InputOTPSlot.displayName = "InputOTPSlot"
+
+const InputOTPSeparator = React.forwardRef(({ ...props }, ref) => (
+  <div ref={ref} role="separator" {...props}>
+    <Minus />
+  </div>
+))
+InputOTPSeparator.displayName = "InputOTPSeparator"
+
+export { InputOTP, InputOTPGroup, InputOTPSlot, InputOTPSeparator }
+import * as React from "react"
+
+import { cn } from "@/lib/utils"
+
+const Input = React.forwardRef(({ className, type, ...props }, ref) => {
+  return (
+    (<input
+      type={type}
+      className={cn(
+        "flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-base shadow-sm transition-colors file:border-0 file:bg-transparent file:text-sm file:font-medium file:text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 md:text-sm",
+        className
+      )}
+      ref={ref}
+      {...props} />)
+  );
+})
+Input.displayName = "Input"
+
+export { Input }
+import * as React from "react"
+import * as LabelPrimitive from "@radix-ui/react-label"
+import { cva } from "class-variance-authority";
+
+import { cn } from "@/lib/utils"
+
+const labelVariants = cva(
+  "text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+)
+
+const Label = React.forwardRef(({ className, ...props }, ref) => (
+  <LabelPrimitive.Root ref={ref} className={cn(labelVariants(), className)} {...props} />
+))
+Label.displayName = LabelPrimitive.Root.displayName
+
+export { Label }
+"use client"
+
+import * as React from "react"
+import * as MenubarPrimitive from "@radix-ui/react-menubar"
+import { Check, ChevronRight, Circle } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+
+function MenubarMenu({
+  ...props
+}) {
+  return <MenubarPrimitive.Menu {...props} />;
+}
+
+function MenubarGroup({
+  ...props
+}) {
+  return <MenubarPrimitive.Group {...props} />;
+}
+
+function MenubarPortal({
+  ...props
+}) {
+  return <MenubarPrimitive.Portal {...props} />;
+}
+
+function MenubarRadioGroup({
+  ...props
+}) {
+  return <MenubarPrimitive.RadioGroup {...props} />;
+}
+
+function MenubarSub({
+  ...props
+}) {
+  return <MenubarPrimitive.Sub data-slot="menubar-sub" {...props} />;
+}
+
+const Menubar = React.forwardRef(({ className, ...props }, ref) => (
+  <MenubarPrimitive.Root
+    ref={ref}
+    className={cn(
+      "flex h-9 items-center space-x-1 rounded-md border bg-background p-1 shadow-sm",
+      className
+    )}
+    {...props} />
+))
+Menubar.displayName = MenubarPrimitive.Root.displayName
+
+const MenubarTrigger = React.forwardRef(({ className, ...props }, ref) => (
+  <MenubarPrimitive.Trigger
+    ref={ref}
+    className={cn(
+      "flex cursor-default select-none items-center rounded-sm px-3 py-1 text-sm font-medium outline-none focus:bg-accent focus:text-accent-foreground data-[state=open]:bg-accent data-[state=open]:text-accent-foreground",
+      className
+    )}
+    {...props} />
+))
+MenubarTrigger.displayName = MenubarPrimitive.Trigger.displayName
+
+const MenubarSubTrigger = React.forwardRef(({ className, inset, children, ...props }, ref) => (
+  <MenubarPrimitive.SubTrigger
+    ref={ref}
+    className={cn(
+      "flex cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[state=open]:bg-accent data-[state=open]:text-accent-foreground",
+      inset && "pl-8",
+      className
+    )}
+    {...props}>
+    {children}
+    <ChevronRight className="ml-auto h-4 w-4" />
+  </MenubarPrimitive.SubTrigger>
+))
+MenubarSubTrigger.displayName = MenubarPrimitive.SubTrigger.displayName
+
+const MenubarSubContent = React.forwardRef(({ className, ...props }, ref) => (
+  <MenubarPrimitive.SubContent
+    ref={ref}
+    className={cn(
+      "z-50 min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+      className
+    )}
+    {...props} />
+))
+MenubarSubContent.displayName = MenubarPrimitive.SubContent.displayName
+
+const MenubarContent = React.forwardRef((
+  { className, align = "start", alignOffset = -4, sideOffset = 8, ...props },
+  ref
+) => (
+  <MenubarPrimitive.Portal>
+    <MenubarPrimitive.Content
+      ref={ref}
+      align={align}
+      alignOffset={alignOffset}
+      sideOffset={sideOffset}
+      className={cn(
+        "z-50 min-w-[12rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md data-[state=open]:animate-in data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+        className
+      )}
+      {...props} />
+  </MenubarPrimitive.Portal>
+))
+MenubarContent.displayName = MenubarPrimitive.Content.displayName
+
+const MenubarItem = React.forwardRef(({ className, inset, ...props }, ref) => (
+  <MenubarPrimitive.Item
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      inset && "pl-8",
+      className
+    )}
+    {...props} />
+))
+MenubarItem.displayName = MenubarPrimitive.Item.displayName
+
+const MenubarCheckboxItem = React.forwardRef(({ className, children, checked, ...props }, ref) => (
+  <MenubarPrimitive.CheckboxItem
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      className
+    )}
+    checked={checked}
+    {...props}>
+    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+      <MenubarPrimitive.ItemIndicator>
+        <Check className="h-4 w-4" />
+      </MenubarPrimitive.ItemIndicator>
+    </span>
+    {children}
+  </MenubarPrimitive.CheckboxItem>
+))
+MenubarCheckboxItem.displayName = MenubarPrimitive.CheckboxItem.displayName
+
+const MenubarRadioItem = React.forwardRef(({ className, children, ...props }, ref) => (
+  <MenubarPrimitive.RadioItem
+    ref={ref}
+    className={cn(
+      "relative flex cursor-default select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      className
+    )}
+    {...props}>
+    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+      <MenubarPrimitive.ItemIndicator>
+        <Circle className="h-4 w-4 fill-current" />
+      </MenubarPrimitive.ItemIndicator>
+    </span>
+    {children}
+  </MenubarPrimitive.RadioItem>
+))
+MenubarRadioItem.displayName = MenubarPrimitive.RadioItem.displayName
+
+const MenubarLabel = React.forwardRef(({ className, inset, ...props }, ref) => (
+  <MenubarPrimitive.Label
+    ref={ref}
+    className={cn("px-2 py-1.5 text-sm font-semibold", inset && "pl-8", className)}
+    {...props} />
+))
+MenubarLabel.displayName = MenubarPrimitive.Label.displayName
+
+const MenubarSeparator = React.forwardRef(({ className, ...props }, ref) => (
+  <MenubarPrimitive.Separator
+    ref={ref}
+    className={cn("-mx-1 my-1 h-px bg-muted", className)}
+    {...props} />
+))
+MenubarSeparator.displayName = MenubarPrimitive.Separator.displayName
+
+const MenubarShortcut = ({
+  className,
+  ...props
+}) => {
+  return (
+    (<span
+      className={cn("ml-auto text-xs tracking-widest text-muted-foreground", className)}
+      {...props} />)
+  );
+}
+MenubarShortcut.displayname = "MenubarShortcut"
+
+export {
+  Menubar,
+  MenubarMenu,
+  MenubarTrigger,
+  MenubarContent,
+  MenubarItem,
+  MenubarSeparator,
+  MenubarLabel,
+  MenubarCheckboxItem,
+  MenubarRadioGroup,
+  MenubarRadioItem,
+  MenubarPortal,
+  MenubarSubContent,
+  MenubarSubTrigger,
+  MenubarGroup,
+  MenubarSub,
+  MenubarShortcut,
+}
+import * as React from "react"
+import * as NavigationMenuPrimitive from "@radix-ui/react-navigation-menu"
+import { cva } from "class-variance-authority"
+import { ChevronDown } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+
+const NavigationMenu = React.forwardRef(({ className, children, ...props }, ref) => (
+  <NavigationMenuPrimitive.Root
+    ref={ref}
+    className={cn(
+      "relative z-10 flex max-w-max flex-1 items-center justify-center",
+      className
+    )}
+    {...props}>
+    {children}
+    <NavigationMenuViewport />
+  </NavigationMenuPrimitive.Root>
+))
+NavigationMenu.displayName = NavigationMenuPrimitive.Root.displayName
+
+const NavigationMenuList = React.forwardRef(({ className, ...props }, ref) => (
+  <NavigationMenuPrimitive.List
+    ref={ref}
+    className={cn(
+      "group flex flex-1 list-none items-center justify-center space-x-1",
+      className
+    )}
+    {...props} />
+))
+NavigationMenuList.displayName = NavigationMenuPrimitive.List.displayName
+
+const NavigationMenuItem = NavigationMenuPrimitive.Item
+
+const navigationMenuTriggerStyle = cva(
+  "group inline-flex h-9 w-max items-center justify-center rounded-md bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground focus:outline-none disabled:pointer-events-none disabled:opacity-50 data-[active]:bg-accent/50 data-[state=open]:bg-accent/50"
+)
+
+const NavigationMenuTrigger = React.forwardRef(({ className, children, ...props }, ref) => (
+  <NavigationMenuPrimitive.Trigger
+    ref={ref}
+    className={cn(navigationMenuTriggerStyle(), "group", className)}
+    {...props}>
+    {children}{" "}
+    <ChevronDown
+      className="relative top-[1px] ml-1 h-3 w-3 transition duration-300 group-data-[state=open]:rotate-180"
+      aria-hidden="true" />
+  </NavigationMenuPrimitive.Trigger>
+))
+NavigationMenuTrigger.displayName = NavigationMenuPrimitive.Trigger.displayName
+
+const NavigationMenuContent = React.forwardRef(({ className, ...props }, ref) => (
+  <NavigationMenuPrimitive.Content
+    ref={ref}
+    className={cn(
+      "left-0 top-0 w-full data-[motion^=from-]:animate-in data-[motion^=to-]:animate-out data-[motion^=from-]:fade-in data-[motion^=to-]:fade-out data-[motion=from-end]:slide-in-from-right-52 data-[motion=from-start]:slide-in-from-left-52 data-[motion=to-end]:slide-out-to-right-52 data-[motion=to-start]:slide-out-to-left-52 md:absolute md:w-auto ",
+      className
+    )}
+    {...props} />
+))
+NavigationMenuContent.displayName = NavigationMenuPrimitive.Content.displayName
+
+const NavigationMenuLink = NavigationMenuPrimitive.Link
+
+const NavigationMenuViewport = React.forwardRef(({ className, ...props }, ref) => (
+  <div className={cn("absolute left-0 top-full flex justify-center")}>
+    <NavigationMenuPrimitive.Viewport
+      className={cn(
+        "origin-top-center relative mt-1.5 h-[var(--radix-navigation-menu-viewport-height)] w-full overflow-hidden rounded-md border bg-popover text-popover-foreground shadow data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-90 md:w-[var(--radix-navigation-menu-viewport-width)]",
+        className
+      )}
+      ref={ref}
+      {...props} />
+  </div>
+))
+NavigationMenuViewport.displayName =
+  NavigationMenuPrimitive.Viewport.displayName
+
+const NavigationMenuIndicator = React.forwardRef(({ className, ...props }, ref) => (
+  <NavigationMenuPrimitive.Indicator
+    ref={ref}
+    className={cn(
+      "top-full z-[1] flex h-1.5 items-end justify-center overflow-hidden data-[state=visible]:animate-in data-[state=hidden]:animate-out data-[state=hidden]:fade-out data-[state=visible]:fade-in",
+      className
+    )}
+    {...props}>
+    <div
+      className="relative top-[60%] h-2 w-2 rotate-45 rounded-tl-sm bg-border shadow-md" />
+  </NavigationMenuPrimitive.Indicator>
+))
+NavigationMenuIndicator.displayName =
+  NavigationMenuPrimitive.Indicator.displayName
+
+export {
+  navigationMenuTriggerStyle,
+  NavigationMenu,
+  NavigationMenuList,
+  NavigationMenuItem,
+  NavigationMenuContent,
+  NavigationMenuTrigger,
+  NavigationMenuLink,
+  NavigationMenuIndicator,
+  NavigationMenuViewport,
+}
+import * as React from "react"
+import { ChevronLeft, ChevronRight, MoreHorizontal } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+import { buttonVariants } from "@/components/ui/button";
+
+const Pagination = ({
+  className,
+  ...props
+}) => (
+  <nav
+    role="navigation"
+    aria-label="pagination"
+    className={cn("mx-auto flex w-full justify-center", className)}
+    {...props} />
+)
+Pagination.displayName = "Pagination"
+
+const PaginationContent = React.forwardRef(({ className, ...props }, ref) => (
+  <ul
+    ref={ref}
+    className={cn("flex flex-row items-center gap-1", className)}
+    {...props} />
+))
+PaginationContent.displayName = "PaginationContent"
+
+const PaginationItem = React.forwardRef(({ className, ...props }, ref) => (
+  <li ref={ref} className={cn("", className)} {...props} />
+))
+PaginationItem.displayName = "PaginationItem"
+
+const PaginationLink = ({
+  className,
+  isActive,
+  size = "icon",
+  ...props
+}) => (
+  <a
+    aria-current={isActive ? "page" : undefined}
+    className={cn(buttonVariants({
+      variant: isActive ? "outline" : "ghost",
+      size,
+    }), className)}
+    {...props} />
+)
+PaginationLink.displayName = "PaginationLink"
+
+const PaginationPrevious = ({
+  className,
+  ...props
+}) => (
+  <PaginationLink
+    aria-label="Go to previous page"
+    size="default"
+    className={cn("gap-1 pl-2.5", className)}
+    {...props}>
+    <ChevronLeft className="h-4 w-4" />
+    <span>Previous</span>
+  </PaginationLink>
+)
+PaginationPrevious.displayName = "PaginationPrevious"
+
+const PaginationNext = ({
+  className,
+  ...props
+}) => (
+  <PaginationLink
+    aria-label="Go to next page"
+    size="default"
+    className={cn("gap-1 pr-2.5", className)}
+    {...props}>
+    <span>Next</span>
+    <ChevronRight className="h-4 w-4" />
+  </PaginationLink>
+)
+PaginationNext.displayName = "PaginationNext"
+
+const PaginationEllipsis = ({
+  className,
+  ...props
+}) => (
+  <span
+    aria-hidden
+    className={cn("flex h-9 w-9 items-center justify-center", className)}
+    {...props}>
+    <MoreHorizontal className="h-4 w-4" />
+    <span className="sr-only">More pages</span>
+  </span>
+)
+PaginationEllipsis.displayName = "PaginationEllipsis"
+
+export {
+  Pagination,
+  PaginationContent,
+  PaginationLink,
+  PaginationItem,
+  PaginationPrevious,
+  PaginationNext,
+  PaginationEllipsis,
+}
+import * as React from "react"
+import * as PopoverPrimitive from "@radix-ui/react-popover"
+
+import { cn } from "@/lib/utils"
+
+const Popover = PopoverPrimitive.Root
+
+const PopoverTrigger = PopoverPrimitive.Trigger
+
+const PopoverAnchor = PopoverPrimitive.Anchor
+
+const PopoverContent = React.forwardRef(({ className, align = "center", sideOffset = 4, ...props }, ref) => (
+  <PopoverPrimitive.Portal>
+    <PopoverPrimitive.Content
+      ref={ref}
+      align={align}
+      sideOffset={sideOffset}
+      className={cn(
+        "z-50 w-72 rounded-md border bg-popover p-4 text-popover-foreground shadow-md outline-none data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+        className
+      )}
+      {...props} />
+  </PopoverPrimitive.Portal>
+))
+PopoverContent.displayName = PopoverPrimitive.Content.displayName
+
+export { Popover, PopoverTrigger, PopoverContent, PopoverAnchor }
+"use client"
+
+import * as React from "react"
+import * as ProgressPrimitive from "@radix-ui/react-progress"
+
+import { cn } from "@/lib/utils"
+
+const Progress = React.forwardRef(({ className, value, ...props }, ref) => (
+  <ProgressPrimitive.Root
+    ref={ref}
+    className={cn(
+      "relative h-2 w-full overflow-hidden rounded-full bg-primary/20",
+      className
+    )}
+    {...props}>
+    <ProgressPrimitive.Indicator
+      className="h-full w-full flex-1 bg-primary transition-all"
+      style={{ transform: `translateX(-${100 - (value || 0)}%)` }} />
+  </ProgressPrimitive.Root>
+))
+Progress.displayName = ProgressPrimitive.Root.displayName
+
+export { Progress }
+import * as React from "react"
+import * as RadioGroupPrimitive from "@radix-ui/react-radio-group"
+import { Circle } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+
+const RadioGroup = React.forwardRef(({ className, ...props }, ref) => {
+  return (<RadioGroupPrimitive.Root className={cn("grid gap-2", className)} {...props} ref={ref} />);
+})
+RadioGroup.displayName = RadioGroupPrimitive.Root.displayName
+
+const RadioGroupItem = React.forwardRef(({ className, ...props }, ref) => {
+  return (
+    (<RadioGroupPrimitive.Item
+      ref={ref}
+      className={cn(
+        "aspect-square h-4 w-4 rounded-full border border-primary text-primary shadow focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
+        className
+      )}
+      {...props}>
+      <RadioGroupPrimitive.Indicator className="flex items-center justify-center">
+        <Circle className="h-3.5 w-3.5 fill-primary" />
+      </RadioGroupPrimitive.Indicator>
+    </RadioGroupPrimitive.Item>)
+  );
+})
+RadioGroupItem.displayName = RadioGroupPrimitive.Item.displayName
+
+export { RadioGroup, RadioGroupItem }
+"use client"
+
+import { GripVertical } from "lucide-react"
+import * as ResizablePrimitive from "react-resizable-panels"
+
+import { cn } from "@/lib/utils"
+
+const ResizablePanelGroup = ({
+  className,
+  ...props
+}) => (
+  <ResizablePrimitive.PanelGroup
+    className={cn(
+      "flex h-full w-full data-[panel-group-direction=vertical]:flex-col",
+      className
+    )}
+    {...props} />
+)
+
+const ResizablePanel = ResizablePrimitive.Panel
+
+const ResizableHandle = ({
+  withHandle,
+  className,
+  ...props
+}) => (
+  <ResizablePrimitive.PanelResizeHandle
+    className={cn(
+      "relative flex w-px items-center justify-center bg-border after:absolute after:inset-y-0 after:left-1/2 after:w-1 after:-translate-x-1/2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-1 data-[panel-group-direction=vertical]:h-px data-[panel-group-direction=vertical]:w-full data-[panel-group-direction=vertical]:after:left-0 data-[panel-group-direction=vertical]:after:h-1 data-[panel-group-direction=vertical]:after:w-full data-[panel-group-direction=vertical]:after:-translate-y-1/2 data-[panel-group-direction=vertical]:after:translate-x-0 [&[data-panel-group-direction=vertical]>div]:rotate-90",
+      className
+    )}
+    {...props}>
+    {withHandle && (
+      <div
+        className="z-10 flex h-4 w-3 items-center justify-center rounded-sm border bg-border">
+        <GripVertical className="h-2.5 w-2.5" />
+      </div>
+    )}
+  </ResizablePrimitive.PanelResizeHandle>
+)
+
+export { ResizablePanelGroup, ResizablePanel, ResizableHandle }
+import * as React from "react"
+import { cn } from "../../lib/utils"
+import { buildSrcSet, buildTransformUrl, splitImageProps } from "./image-helpers"
+import { useResponsiveImage } from "./use-responsive-image"
+
+export const ResponsiveImage = React.forwardRef(
+  ({ src, parsed, fittingType, focalPoint, quality, className, style, aspectRatio, onLoad, onSourceChange, ...props }, ref) => {
+    const { wrapperRef, imgRef, loaded, options, handleLoad } = useResponsiveImage(
+      { parsed, fittingType, focalPoint, quality, className, onLoad, onSourceChange }, ref
+    )
+    const { wrapperProps, imageProps } = splitImageProps(props)
+
+    return (
+      <span
+        ref={wrapperRef}
+        className={cn("inline-block relative", className)}
+        style={{ aspectRatio, ...style }}
+        {...wrapperProps}
+        data-base44-image=""
+        data-base44-image-src={src}
+      >
+        {/* Contain both image layers inside the padded content box without adding an edit target. */}
+        <span data-source-location={undefined} className="block relative w-full h-full overflow-hidden">
+          {options && !loaded && (
+            <img
+              data-source-location={undefined}
+              src={buildTransformUrl(parsed, {
+                ...options,
+                width: 20,
+                height: options.height
+                  ? Math.max(1, Math.round((20 * options.height) / options.width))
+                  : undefined,
+                quality: 20,
+              })}
+              alt=""
+              aria-hidden="true"
+              className="w-full h-full inset-0 absolute"
+              style={{
+                objectFit: fittingType === "fit" ? "contain" : "cover",
+                filter: "blur(10px)",
+                transform: "scale(1.1)",
+              }}
+            />
+          )}
+          {options && (
+            <img
+              data-source-location={undefined}
+              ref={imgRef}
+              src={buildTransformUrl(parsed, options)}
+              srcSet={buildSrcSet(parsed, options)}
+              loading="lazy"
+              className={cn(
+                "w-full h-full inset-0 absolute",
+                fittingType === "fit" ? "object-contain" : "object-cover"
+              )}
+              onLoad={handleLoad}
+              {...imageProps}
+            />
+          )}
+        </span>
+      </span>
+    )
+  }
+)
+ResponsiveImage.displayName = "ResponsiveImage"
+import * as React from "react"
+import * as ScrollAreaPrimitive from "@radix-ui/react-scroll-area"
+
+import { cn } from "@/lib/utils"
+
+const ScrollArea = React.forwardRef(({ className, children, ...props }, ref) => (
+  <ScrollAreaPrimitive.Root
+    ref={ref}
+    className={cn("relative overflow-hidden", className)}
+    {...props}>
+    <ScrollAreaPrimitive.Viewport className="h-full w-full rounded-[inherit]">
+      {children}
+    </ScrollAreaPrimitive.Viewport>
+    <ScrollBar />
+    <ScrollAreaPrimitive.Corner />
+  </ScrollAreaPrimitive.Root>
+))
+ScrollArea.displayName = ScrollAreaPrimitive.Root.displayName
+
+const ScrollBar = React.forwardRef(({ className, orientation = "vertical", ...props }, ref) => (
+  <ScrollAreaPrimitive.ScrollAreaScrollbar
+    ref={ref}
+    orientation={orientation}
+    className={cn(
+      "flex touch-none select-none transition-colors",
+      orientation === "vertical" &&
+        "h-full w-2.5 border-l border-l-transparent p-[1px]",
+      orientation === "horizontal" &&
+        "h-2.5 flex-col border-t border-t-transparent p-[1px]",
+      className
+    )}
+    {...props}>
+    <ScrollAreaPrimitive.ScrollAreaThumb className="relative flex-1 rounded-full bg-border" />
+  </ScrollAreaPrimitive.ScrollAreaScrollbar>
+))
+ScrollBar.displayName = ScrollAreaPrimitive.ScrollAreaScrollbar.displayName
+
+export { ScrollArea, ScrollBar }
+"use client"
+
+import * as React from "react"
+import * as SelectPrimitive from "@radix-ui/react-select"
+import { Check, ChevronDown, ChevronUp } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+
+const Select = SelectPrimitive.Root
+
+const SelectGroup = SelectPrimitive.Group
+
+const SelectValue = SelectPrimitive.Value
+
+const SelectTrigger = React.forwardRef(({ className, children, ...props }, ref) => (
+  <SelectPrimitive.Trigger
+    ref={ref}
+    className={cn(
+      "flex h-9 w-full items-center justify-between whitespace-nowrap rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm ring-offset-background data-[placeholder]:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50 [&>span]:line-clamp-1",
+      className
+    )}
+    {...props}>
+    {children}
+    <SelectPrimitive.Icon asChild>
+      <ChevronDown className="h-4 w-4 opacity-50" />
+    </SelectPrimitive.Icon>
+  </SelectPrimitive.Trigger>
+))
+SelectTrigger.displayName = SelectPrimitive.Trigger.displayName
+
+const SelectScrollUpButton = React.forwardRef(({ className, ...props }, ref) => (
+  <SelectPrimitive.ScrollUpButton
+    ref={ref}
+    className={cn("flex cursor-default items-center justify-center py-1", className)}
+    {...props}>
+    <ChevronUp className="h-4 w-4" />
+  </SelectPrimitive.ScrollUpButton>
+))
+SelectScrollUpButton.displayName = SelectPrimitive.ScrollUpButton.displayName
+
+const SelectScrollDownButton = React.forwardRef(({ className, ...props }, ref) => (
+  <SelectPrimitive.ScrollDownButton
+    ref={ref}
+    className={cn("flex cursor-default items-center justify-center py-1", className)}
+    {...props}>
+    <ChevronDown className="h-4 w-4" />
+  </SelectPrimitive.ScrollDownButton>
+))
+SelectScrollDownButton.displayName =
+  SelectPrimitive.ScrollDownButton.displayName
+
+const SelectContent = React.forwardRef(({ className, children, position = "popper", ...props }, ref) => (
+  <SelectPrimitive.Portal>
+    <SelectPrimitive.Content
+      ref={ref}
+      className={cn(
+        "relative z-50 max-h-96 min-w-[8rem] overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-md data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+        position === "popper" &&
+          "data-[side=bottom]:translate-y-1 data-[side=left]:-translate-x-1 data-[side=right]:translate-x-1 data-[side=top]:-translate-y-1",
+        className
+      )}
+      position={position}
+      {...props}>
+      <SelectScrollUpButton />
+      <SelectPrimitive.Viewport
+        className={cn("p-1", position === "popper" &&
+          "h-[var(--radix-select-trigger-height)] w-full min-w-[var(--radix-select-trigger-width)]")}>
+        {children}
+      </SelectPrimitive.Viewport>
+      <SelectScrollDownButton />
+    </SelectPrimitive.Content>
+  </SelectPrimitive.Portal>
+))
+SelectContent.displayName = SelectPrimitive.Content.displayName
+
+const SelectLabel = React.forwardRef(({ className, ...props }, ref) => (
+  <SelectPrimitive.Label
+    ref={ref}
+    className={cn("px-2 py-1.5 text-sm font-semibold", className)}
+    {...props} />
+))
+SelectLabel.displayName = SelectPrimitive.Label.displayName
+
+const SelectItem = React.forwardRef(({ className, children, ...props }, ref) => (
+  <SelectPrimitive.Item
+    ref={ref}
+    className={cn(
+      "relative flex w-full cursor-default select-none items-center rounded-sm py-1.5 pl-2 pr-8 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      className
+    )}
+    {...props}>
+    <span className="absolute right-2 flex h-3.5 w-3.5 items-center justify-center">
+      <SelectPrimitive.ItemIndicator>
+        <Check className="h-4 w-4" />
+      </SelectPrimitive.ItemIndicator>
+    </span>
+    <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+  </SelectPrimitive.Item>
+))
+SelectItem.displayName = SelectPrimitive.Item.displayName
+
+const SelectSeparator = React.forwardRef(({ className, ...props }, ref) => (
+  <SelectPrimitive.Separator
+    ref={ref}
+    className={cn("-mx-1 my-1 h-px bg-muted", className)}
+    {...props} />
+))
+SelectSeparator.displayName = SelectPrimitive.Separator.displayName
+
+export {
+  Select,
+  SelectGroup,
+  SelectValue,
+  SelectTrigger,
+  SelectContent,
+  SelectLabel,
+  SelectItem,
+  SelectSeparator,
+  SelectScrollUpButton,
+  SelectScrollDownButton,
+}
+import * as React from "react"
+import * as SeparatorPrimitive from "@radix-ui/react-separator"
+
+import { cn } from "@/lib/utils"
+
+const Separator = React.forwardRef((
+  { className, orientation = "horizontal", decorative = true, ...props },
+  ref
+) => (
+  <SeparatorPrimitive.Root
+    ref={ref}
+    decorative={decorative}
+    orientation={orientation}
+    className={cn(
+      "shrink-0 bg-border",
+      orientation === "horizontal" ? "h-[1px] w-full" : "h-full w-[1px]",
+      className
+    )}
+    {...props} />
+))
+Separator.displayName = SeparatorPrimitive.Root.displayName
+
+export { Separator }
+"use client";
+import * as React from "react"
+import * as SheetPrimitive from "@radix-ui/react-dialog"
+import { cva } from "class-variance-authority";
+import { X } from "lucide-react"
+
+import { cn } from "@/lib/utils"
+
+const Sheet = SheetPrimitive.Root
+
+const SheetTrigger = SheetPrimitive.Trigger
+
+const SheetClose = SheetPrimitive.Close
+
+const SheetPortal = SheetPrimitive.Portal
+
+const SheetOverlay = React.forwardRef(({ className, ...props }, ref) => (
+  <SheetPrimitive.Overlay
+    className={cn(
+      "fixed inset-0 z-50 bg-black/80  data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+      className
+    )}
+    {...props}
+    ref={ref} />
+))
+SheetOverlay.displayName = SheetPrimitive.Overlay.displayName
+
+const sheetVariants = cva(
+  "fixed z-50 gap-4 bg-background p-6 shadow-lg transition ease-in-out data-[state=closed]:duration-300 data-[state=open]:duration-500 data-[state=open]:animate-in data-[state=closed]:animate-out",
+  {
+    variants: {
+      side: {
+        top: "inset-x-0 top-0 border-b data-[state=closed]:slide-out-to-top data-[state=open]:slide-in-from-top",
+        bottom:
+          "inset-x-0 bottom-0 border-t data-[state=closed]:slide-out-to-bottom data-[state=open]:slide-in-from-bottom",
+        left: "inset-y-0 left-0 h-full w-3/4 border-r data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left sm:max-w-sm",
+        right:
+          "inset-y-0 right-0 h-full w-3/4 border-l data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right sm:max-w-sm",
+      },
+    },
+    defaultVariants: {
+      side: "right",
+    },
+  }
+)
+
+const SheetContent = React.forwardRef(({ side = "right", className, children, ...props }, ref) => (
+  <SheetPortal>
+    <SheetOverlay />
+    <SheetPrimitive.Content ref={ref} className={cn(sheetVariants({ side }), className)} {...props}>
+      <SheetPrimitive.Close
+        className="absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-secondary">
+        <X className="h-4 w-4" />
+        <span className="sr-only">Close</span>
+      </SheetPrimitive.Close>
+      {children}
+    </SheetPrimitive.Content>
+  </SheetPortal>
+))
+SheetContent.displayName = SheetPrimitive.Content.displayName
+
+const SheetHeader = ({
+  className,
+  ...props
+}) => (
+  <div
+    className={cn("flex flex-col space-y-2 text-center sm:text-left", className)}
+    {...props} />
+)
+SheetHeader.displayName = "SheetHeader"
+
+const SheetFooter = ({
+  className,
+  ...props
+}) => (
+  <div
+    className={cn("flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2", className)}
+    {...props} />
+)
+SheetFooter.displayName = "SheetFooter"
+
+const SheetTitle = React.forwardRef(({ className, ...props }, ref) => (
+  <SheetPrimitive.Title
+    ref={ref}
+    className={cn("text-lg font-semibold text-foreground", className)}
+    {...props} />
+))
+SheetTitle.displayName = SheetPrimitive.Title.displayName
+
+const SheetDescription = React.forwardRef(({ className, ...props }, ref) => (
+  <SheetPrimitive.Description
+    ref={ref}
+    className={cn("text-sm text-muted-foreground", className)}
+    {...props} />
+))
+SheetDescription.displayName = SheetPrimitive.Description.displayName
+
+export {
+  Sheet,
+  SheetPortal,
+  SheetOverlay,
+  SheetTrigger,
+  SheetClose,
+  SheetContent,
+  SheetHeader,
+  SheetFooter,
+  SheetTitle,
+  SheetDescription,
+}
+import * as React from "react"
+import { Slot } from "@radix-ui/react-slot"
+import { cva } from "class-variance-authority";
+import { PanelLeft } from "lucide-react"
+
+import { useIsMobile } from "@/hooks/use-mobile"
+import { cn } from "@/lib/utils"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Separator } from "@/components/ui/separator"
+import { Sheet, SheetContent } from "@/components/ui/sheet"
+import { Skeleton } from "@/components/ui/skeleton"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
+
+const SIDEBAR_COOKIE_NAME = "sidebar_state"
+const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
+const SIDEBAR_WIDTH = "16rem"
+const SIDEBAR_WIDTH_MOBILE = "18rem"
+const SIDEBAR_WIDTH_ICON = "3rem"
+const SIDEBAR_KEYBOARD_SHORTCUT = "b"
+
+const SidebarContext = React.createContext(null)
+
+function useSidebar() {
+  const context = React.useContext(SidebarContext)
+  if (!context) {
+    throw new Error("useSidebar must be used within a SidebarProvider.")
+  }
+
+  return context
+}
+
+const SidebarProvider = React.forwardRef((
+  {
+    defaultOpen = true,
+    open: openProp,
+    onOpenChange: setOpenProp,
+    className,
+    style,
+    children,
+    ...props
+  },
+  ref
+) => {
+  const isMobile = useIsMobile()
+  const [openMobile, setOpenMobile] = React.useState(false)
+
+  // This is the internal state of the sidebar.
+  // We use openProp and setOpenProp for control from outside the component.
+  const [_open, _setOpen] = React.useState(defaultOpen)
+  const open = openProp ?? _open
+  const setOpen = React.useCallback((value) => {
+    const openState = typeof value === "function" ? value(open) : value
+    if (setOpenProp) {
+      setOpenProp(openState)
+    } else {
+      _setOpen(openState)
+    }
+
+    // This sets the cookie to keep the sidebar state.
+    document.cookie = `${SIDEBAR_COOKIE_NAME}=${openState}; path=/; max-age=${SIDEBAR_COOKIE_MAX_AGE}`
+  }, [setOpenProp, open])
+
+  // Helper to toggle the sidebar.
+  const toggleSidebar = React.useCallback(() => {
+    return isMobile
+      ? setOpenMobile((open) => !open)
+      : setOpen((open) => !open);
+  }, [isMobile, setOpen, setOpenMobile])
+
+  // Adds a keyboard shortcut to toggle the sidebar.
+  React.useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (
+        event.key === SIDEBAR_KEYBOARD_SHORTCUT &&
+        (event.metaKey || event.ctrlKey)
+      ) {
+        event.preventDefault()
+        toggleSidebar()
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [toggleSidebar])
+
+  // We add a state so that we can do data-state="expanded" or "collapsed".
+  // This makes it easier to style the sidebar with Tailwind classes.
+  const state = open ? "expanded" : "collapsed"
+
+  const contextValue = React.useMemo(() => ({
+    state,
+    open,
+    setOpen,
+    isMobile,
+    openMobile,
+    setOpenMobile,
+    toggleSidebar,
+  }), [state, open, setOpen, isMobile, openMobile, setOpenMobile, toggleSidebar])
+
+  return (
+    (<SidebarContext.Provider value={contextValue}>
+      <TooltipProvider delayDuration={0}>
+        <div
+          style={
+            {
+              "--sidebar-width": SIDEBAR_WIDTH,
+              "--sidebar-width-icon": SIDEBAR_WIDTH_ICON,
+              ...style
+            }
+          }
+          className={cn(
+            "group/sidebar-wrapper flex min-h-svh w-full has-[[data-variant=inset]]:bg-sidebar",
+            className
+          )}
+          ref={ref}
+          {...props}>
+          {children}
+        </div>
+      </TooltipProvider>
+    </SidebarContext.Provider>)
+  );
+})
+SidebarProvider.displayName = "SidebarProvider"
+
+const Sidebar = React.forwardRef((
+  {
+    side = "left",
+    variant = "sidebar",
+    collapsible = "offcanvas",
+    className,
+    children,
+    ...props
+  },
+  ref
+) => {
+  const { isMobile, state, openMobile, setOpenMobile } = useSidebar()
+
+  if (collapsible === "none") {
+    return (
+      (<div
+        className={cn(
+          "flex h-full w-[--sidebar-width] flex-col bg-sidebar text-sidebar-foreground",
+          className
+        )}
+        ref={ref}
+        {...props}>
+        {children}
+      </div>)
+    );
+  }
+
+  if (isMobile) {
+    return (
+      (<Sheet open={openMobile} onOpenChange={setOpenMobile} {...props}>
+        <SheetContent
+          data-sidebar="sidebar"
+          data-mobile="true"
+          className="w-[--sidebar-width] bg-sidebar p-0 text-sidebar-foreground [&>button]:hidden"
+          style={
+            {
+              "--sidebar-width": SIDEBAR_WIDTH_MOBILE
+            }
+          }
+          side={side}>
+          <div className="flex h-full w-full flex-col">{children}</div>
+        </SheetContent>
+      </Sheet>)
+    );
+  }
+
+  return (
+    (<div
+      ref={ref}
+      className="group peer hidden text-sidebar-foreground md:block"
+      data-state={state}
+      data-collapsible={state === "collapsed" ? collapsible : ""}
+      data-variant={variant}
+      data-side={side}>
+      {/* This is what handles the sidebar gap on desktop */}
+      <div
+        className={cn(
+          "relative h-svh w-[--sidebar-width] bg-transparent transition-[width] duration-200 ease-linear",
+          "group-data-[collapsible=offcanvas]:w-0",
+          "group-data-[side=right]:rotate-180",
+          variant === "floating" || variant === "inset"
+            ? "group-data-[collapsible=icon]:w-[calc(var(--sidebar-width-icon)_+_theme(spacing.4))]"
+            : "group-data-[collapsible=icon]:w-[--sidebar-width-icon]"
+        )} />
+      <div
+        className={cn(
+          "fixed inset-y-0 z-10 hidden h-svh w-[--sidebar-width] transition-[left,right,width] duration-200 ease-linear md:flex",
+          side === "left"
+            ? "left-0 group-data-[collapsible=offcanvas]:left-[calc(var(--sidebar-width)*-1)]"
+            : "right-0 group-data-[collapsible=offcanvas]:right-[calc(var(--sidebar-width)*-1)]",
+          // Adjust the padding for floating and inset variants.
+          variant === "floating" || variant === "inset"
+            ? "p-2 group-data-[collapsible=icon]:w-[calc(var(--sidebar-width-icon)_+_theme(spacing.4)_+2px)]"
+            : "group-data-[collapsible=icon]:w-[--sidebar-width-icon] group-data-[side=left]:border-r group-data-[side=right]:border-l",
+          className
+        )}
+        {...props}>
+        <div
+          data-sidebar="sidebar"
+          className="flex h-full w-full flex-col bg-sidebar group-data-[variant=floating]:rounded-lg group-data-[variant=floating]:border group-data-[variant=floating]:border-sidebar-border group-data-[variant=floating]:shadow">
+          {children}
+        </div>
+      </div>
+    </div>)
+  );
+})
+Sidebar.displayName = "Sidebar"
+
+const SidebarTrigger = React.forwardRef(({ className, onClick, asChild = false, ...props }, ref) => {
+  const { toggleSidebar } = useSidebar()
+
+  return (
+    (<Button
+      ref={ref}
+      data-sidebar="trigger"
+      variant="ghost"
+      size="icon"
+      className={cn("h-7 w-7", className)}
+      onClick={(event) => {
+        onClick?.(event)
+        toggleSidebar()
+      }}
+      asChild={asChild}
+      {...props}>
+      {asChild ? (
+        <PanelLeft />
+      ) : (
+        <>
+          <PanelLeft />
+          <span className="sr-only">Toggle Sidebar</span>
+        </>
+      )}
+    </Button>)
+  );
+})
+SidebarTrigger.displayName = "SidebarTrigger"
+
+const SidebarRail = React.forwardRef(({ className, ...props }, ref) => {
+  const { toggleSidebar } = useSidebar()
+
+  return (
+    (<button
+      ref={ref}
+      data-sidebar="rail"
+      aria-label="Toggle Sidebar"
+      tabIndex={-1}
+      onClick={toggleSidebar}
+      title="Toggle Sidebar"
+      className={cn(
+        "absolute inset-y-0 z-20 hidden w-4 -translate-x-1/2 transition-all ease-linear after:absolute after:inset-y-0 after:left-1/2 after:w-[2px] hover:after:bg-sidebar-border group-data-[side=left]:-right-4 group-data-[side=right]:left-0 sm:flex",
+        "[[data-side=left]_&]:cursor-w-resize [[data-side=right]_&]:cursor-e-resize",
+        "[[data-side=left][data-state=collapsed]_&]:cursor-e-resize [[data-side=right][data-state=collapsed]_&]:cursor-w-resize",
+        "group-data-[collapsible=offcanvas]:translate-x-0 group-data-[collapsible=offcanvas]:after:left-full group-data-[collapsible=offcanvas]:hover:bg-sidebar",
+        "[[data-side=left][data-collapsible=offcanvas]_&]:-right-2",
+        "[[data-side=right][data-collapsible=offcanvas]_&]:-left-2",
+        className
+      )}
+      {...props} />)
+  );
+})
+SidebarRail.displayName = "SidebarRail"
+
+const SidebarInset = React.forwardRef(({ className, ...props }, ref) => {
+  return (
+    (<main
+      ref={ref}
+      className={cn(
+        "relative flex min-h-svh flex-1 flex-col bg-background",
+        "peer-data-[variant=inset]:min-h-[calc(100svh-theme(spacing.4))] md:peer-data-[variant=inset]:m-2 md:peer-data-[state=collapsed]:peer-data-[variant=inset]:ml-2 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-xl md:peer-data-[variant=inset]:shadow",
+        className
+      )}
+      {...props} />)
+  );
+})
+SidebarInset.displayName = "SidebarInset"
+
+const SidebarInput = React.forwardRef(({ className, ...props }, ref) => {
+  return (
+    (<Input
+      ref={ref}
+      data-sidebar="input"
+      className={cn(
+        "h-8 w-full bg-background shadow-none focus-visible:ring-2 focus-visible:ring-sidebar-ring",
+        className
+      )}
+      {...props} />)
+  );
+})
+SidebarInput.displayName = "SidebarInput"
+
+const SidebarHeader = React.forwardRef(({ className, ...props }, ref) => {
+  return (
+    (<div
+      ref={ref}
+      data-sidebar="header"
+      className={cn("flex flex-col gap-2 p-2", className)}
+      {...props} />)
+  );
+})
+SidebarHeader.displayName = "SidebarHeader"
+
+const SidebarFooter = React.forwardRef(({ className, ...props }, ref) => {
+  return (
+    (<div
+      ref={ref}
+      data-sidebar="footer"
+      className={cn("flex flex-col gap-2 p-2", className)}
+      {...props} />)
+  );
+})
+SidebarFooter.displayName = "SidebarFooter"
+
+const SidebarSeparator = React.forwardRef(({ className, ...props }, ref) => {
+  return (
+    (<Separator
+      ref={ref}
+      data-sidebar="separator"
+      className={cn("mx-2 w-auto bg-sidebar-border", className)}
+      {...props} />)
+  );
+})
+SidebarSeparator.displayName = "SidebarSeparator"
+
+const SidebarContent = React.forwardRef(({ className, ...props }, ref) => {
+  return (
+    (<div
+      ref={ref}
+      data-sidebar="content"
+      className={cn(
+        "flex min-h-0 flex-1 flex-col gap-2 overflow-auto group-data-[collapsible=icon]:overflow-hidden",
+        className
+      )}
+      {...props} />)
+  );
+})
+SidebarContent.displayName = "SidebarContent"
+
+const SidebarGroup = React.forwardRef(({ className, ...props }, ref) => {
+  return (
+    (<div
+      ref={ref}
+      data-sidebar="group"
+      className={cn("relative flex w-full min-w-0 flex-col p-2", className)}
+      {...props} />)
+  );
+})
+SidebarGroup.displayName = "SidebarGroup"
+
+const SidebarGroupLabel = React.forwardRef(({ className, asChild = false, ...props }, ref) => {
+  const Comp = asChild ? Slot : "div"
+
+  return (
+    (<Comp
+      ref={ref}
+      data-sidebar="group-label"
+      className={cn(
+        "flex h-8 shrink-0 items-center rounded-md px-2 text-xs font-medium text-sidebar-foreground/70 outline-none ring-sidebar-ring transition-[margin,opacity] duration-200 ease-linear focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
+        "group-data-[collapsible=icon]:-mt-8 group-data-[collapsible=icon]:opacity-0",
+        className
+      )}
+      {...props} />)
+  );
+})
+SidebarGroupLabel.displayName = "SidebarGroupLabel"
+
+const SidebarGroupAction = React.forwardRef(({ className, asChild = false, ...props }, ref) => {
+  const Comp = asChild ? Slot : "button"
+
+  return (
+    (<Comp
+      ref={ref}
+      data-sidebar="group-action"
+      className={cn(
+        "absolute right-3 top-3.5 flex aspect-square w-5 items-center justify-center rounded-md p-0 text-sidebar-foreground outline-none ring-sidebar-ring transition-transform hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
+        // Increases the hit area of the button on mobile.
+        "after:absolute after:-inset-2 after:md:hidden",
+        "group-data-[collapsible=icon]:hidden",
+        className
+      )}
+      {...props} />)
+  );
+})
+SidebarGroupAction.displayName = "SidebarGroupAction"
+
+const SidebarGroupContent = React.forwardRef(({ className, ...props }, ref) => (
+  <div
+    ref={ref}
+    data-sidebar="group-content"
+    className={cn("w-full text-sm", className)}
+    {...props} />
+))
+SidebarGroupContent.displayName = "SidebarGroupContent"
+
+const SidebarMenu = React.forwardRef(({ className, ...props }, ref) => (
+  <ul
+    ref={ref}
+    data-sidebar="menu"
+    className={cn("flex w-full min-w-0 flex-col gap-1", className)}
+    {...props} />
+))
+SidebarMenu.displayName = "SidebarMenu"
+
+const SidebarMenuItem = React.forwardRef(({ className, ...props }, ref) => (
+  <li
+    ref={ref}
+    data-sidebar="menu-item"
+    className={cn("group/menu-item relative", className)}
+    {...props} />
+))
+SidebarMenuItem.displayName = "SidebarMenuItem"
+
+const sidebarMenuButtonVariants = cva(
+  "peer/menu-button flex w-full items-center gap-2 overflow-hidden rounded-md p-2 text-left text-sm outline-none ring-sidebar-ring transition-[width,height,padding] hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 active:bg-sidebar-accent active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50 group-has-[[data-sidebar=menu-action]]/menu-item:pr-8 aria-disabled:pointer-events-none aria-disabled:opacity-50 data-[active=true]:bg-sidebar-accent data-[active=true]:font-medium data-[active=true]:text-sidebar-accent-foreground data-[state=open]:hover:bg-sidebar-accent data-[state=open]:hover:text-sidebar-accent-foreground group-data-[collapsible=icon]:!size-8 group-data-[collapsible=icon]:!p-2 [&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0",
+  {
+    variants: {
+      variant: {
+        default: "hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+        outline:
+          "bg-background shadow-[0_0_0_1px_hsl(var(--sidebar-border))] hover:bg-sidebar-accent hover:text-sidebar-accent-foreground hover:shadow-[0_0_0_1px_hsl(var(--sidebar-accent))]",
+      },
+      size: {
+        default: "h-8 text-sm",
+        sm: "h-7 text-xs",
+        lg: "h-12 text-sm group-data-[collapsible=icon]:!p-0",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+      size: "default",
+    },
+  }
+)
+
+const SidebarMenuButton = React.forwardRef((
+  {
+    asChild = false,
+    isActive = false,
+    variant = "default",
+    size = "default",
+    tooltip,
+    className,
+    ...props
+  },
+  ref
+) => {
+  const Comp = asChild ? Slot : "button"
+  const { isMobile, state } = useSidebar()
+
+  const button = (
+    <Comp
+      ref={ref}
+      data-sidebar="menu-button"
+      data-size={size}
+      data-active={isActive}
+      className={cn(sidebarMenuButtonVariants({ variant, size }), className)}
+      {...props} />
+  )
+
+  if (!tooltip) {
+    return button
+  }
+
+  if (typeof tooltip === "string") {
+    tooltip = {
+      children: tooltip,
+    }
+  }
+
+  return (
+    (<Tooltip>
+      <TooltipTrigger asChild>{button}</TooltipTrigger>
+      <TooltipContent
+        side="right"
+        align="center"
+        hidden={state !== "collapsed" || isMobile}
+        {...tooltip} />
+    </Tooltip>)
+  );
+})
+SidebarMenuButton.displayName = "SidebarMenuButton"
+
+const SidebarMenuAction = React.forwardRef(({ className, asChild = false, showOnHover = false, ...props }, ref) => {
+  const Comp = asChild ? Slot : "button"
+
+  return (
+    (<Comp
+      ref={ref}
+      data-sidebar="menu-action"
+      className={cn(
+        "absolute right-1 top-1.5 flex aspect-square w-5 items-center justify-center rounded-md p-0 text-sidebar-foreground outline-none ring-sidebar-ring transition-transform hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 peer-hover/menu-button:text-sidebar-accent-foreground [&>svg]:size-4 [&>svg]:shrink-0",
+        // Increases the hit area of the button on mobile.
+        "after:absolute after:-inset-2 after:md:hidden",
+        "peer-data-[size=sm]/menu-button:top-1",
+        "peer-data-[size=default]/menu-button:top-1.5",
+        "peer-data-[size=lg]/menu-button:top-2.5",
+        "group-data-[collapsible=icon]:hidden",
+        showOnHover &&
+        "group-focus-within/menu-item:opacity-100 group-hover/menu-item:opacity-100 data-[state=open]:opacity-100 peer-data-[active=true]/menu-button:text-sidebar-accent-foreground md:opacity-0",
+        className
+      )}
+      {...props} />)
+  );
+})
+SidebarMenuAction.displayName = "SidebarMenuAction"
+
+const SidebarMenuBadge = React.forwardRef(({ className, ...props }, ref) => (
+  <div
+    ref={ref}
+    data-sidebar="menu-badge"
+    className={cn(
+      "pointer-events-none absolute right-1 flex h-5 min-w-5 select-none items-center justify-center rounded-md px-1 text-xs font-medium tabular-nums text-sidebar-foreground",
+      "peer-hover/menu-button:text-sidebar-accent-foreground peer-data-[active=true]/menu-button:text-sidebar-accent-foreground",
+      "peer-data-[size=sm]/menu-button:top-1",
+      "peer-data-[size=default]/menu-button:top-1.5",
+      "peer-data-[size=lg]/menu-button:top-2.5",
+      "group-data-[collapsible=icon]:hidden",
+      className
+    )}
+    {...props} />
+))
+SidebarMenuBadge.displayName = "SidebarMenuBadge"
+
+const SidebarMenuSkeleton = React.forwardRef(({ className, showIcon = false, ...props }, ref) => {
+  // Random width between 50 to 90%.
+  const width = React.useMemo(() => {
+    return `${Math.floor(Math.random() * 40) + 50}%`;
+  }, [])
+
+  return (
+    (<div
+      ref={ref}
+      data-sidebar="menu-skeleton"
+      className={cn("flex h-8 items-center gap-2 rounded-md px-2", className)}
+      {...props}>
+      {showIcon && (
+        <Skeleton className="size-4 rounded-md" data-sidebar="menu-skeleton-icon" />
+      )}
+      <Skeleton
+        className="h-4 max-w-[--skeleton-width] flex-1"
+        data-sidebar="menu-skeleton-text"
+        style={
+          {
+            "--skeleton-width": width
+          }
+        } />
+    </div>)
+  );
+})
+SidebarMenuSkeleton.displayName = "SidebarMenuSkeleton"
+
+const SidebarMenuSub = React.forwardRef(({ className, ...props }, ref) => (
+  <ul
+    ref={ref}
+    data-sidebar="menu-sub"
+    className={cn(
+      "mx-3.5 flex min-w-0 translate-x-px flex-col gap-1 border-l border-sidebar-border px-2.5 py-0.5",
+      "group-data-[collapsible=icon]:hidden",
+      className
+    )}
+    {...props} />
+))
+SidebarMenuSub.displayName = "SidebarMenuSub"
+
+const SidebarMenuSubItem = React.forwardRef(({ ...props }, ref) => <li ref={ref} {...props} />)
+SidebarMenuSubItem.displayName = "SidebarMenuSubItem"
+
+const SidebarMenuSubButton = React.forwardRef(
+  ({ asChild = false, size = "md", isActive, className, ...props }, ref) => {
+    const Comp = asChild ? Slot : "a"
+
+    return (
+      (<Comp
+        ref={ref}
+        data-sidebar="menu-sub-button"
+        data-size={size}
+        data-active={isActive}
+        className={cn(
+          "flex h-7 min-w-0 -translate-x-px items-center gap-2 overflow-hidden rounded-md px-2 text-sidebar-foreground outline-none ring-sidebar-ring hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 active:bg-sidebar-accent active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50 [&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0 [&>svg]:text-sidebar-accent-foreground",
+          "data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground",
+          size === "sm" && "text-xs",
+          size === "md" && "text-sm",
+          "group-data-[collapsible=icon]:hidden",
+          className
+        )}
+        {...props} />)
+    );
+  }
+)
+SidebarMenuSubButton.displayName = "SidebarMenuSubButton"
+
+export {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupAction,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarHeader,
+  SidebarInput,
+  SidebarInset,
+  SidebarMenu,
+  SidebarMenuAction,
+  SidebarMenuBadge,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarMenuSkeleton,
+  SidebarMenuSub,
+  SidebarMenuSubButton,
+  SidebarMenuSubItem,
+  SidebarProvider,
+  SidebarRail,
+  SidebarSeparator,
+  SidebarTrigger,
+  useSidebar,
+}
+import { cn } from "@/lib/utils"
+
+function Skeleton({
+  className,
+  ...props
+}) {
+  return (
+    (<div
+      className={cn("animate-pulse rounded-md bg-primary/10", className)}
+      {...props} />)
+  );
+}
+
+export { Skeleton }
+import * as React from "react"
+import * as SliderPrimitive from "@radix-ui/react-slider"
+
+import { cn } from "@/lib/utils"
+
+const Slider = React.forwardRef(({ className, ...props }, ref) => (
+  <SliderPrimitive.Root
+    ref={ref}
+    className={cn("relative flex w-full touch-none select-none items-center", className)}
+    {...props}>
+    <SliderPrimitive.Track
+      className="relative h-1.5 w-full grow overflow-hidden rounded-full bg-primary/20">
+      <SliderPrimitive.Range className="absolute h-full bg-primary" />
+    </SliderPrimitive.Track>
+    <SliderPrimitive.Thumb
+      className="block h-4 w-4 rounded-full border border-primary/50 bg-background shadow transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50" />
+  </SliderPrimitive.Root>
+))
+Slider.displayName = SliderPrimitive.Root.displayName
+
+export { Slider }
+"use client";
+import { useTheme } from "next-themes"
+import { Toaster as Sonner } from "sonner"
+
+const Toaster = ({
+  ...props
+}) => {
+  const { theme = "system" } = useTheme()
+
+  return (
+    (<Sonner
+      theme={theme}
+      className="toaster group"
+      toastOptions={{
+        classNames: {
+          toast:
+            "group toast group-[.toaster]:bg-background group-[.toaster]:text-foreground group-[.toaster]:border-border group-[.toaster]:shadow-lg",
+          description: "group-[.toast]:text-muted-foreground",
+          actionButton:
+            "group-[.toast]:bg-primary group-[.toast]:text-primary-foreground",
+          cancelButton:
+            "group-[.toast]:bg-muted group-[.toast]:text-muted-foreground",
+        },
+      }}
+      {...props} />)
+  );
+}
+
+export { Toaster }
+import * as React from "react"
+import * as SwitchPrimitives from "@radix-ui/react-switch"
+
+import { cn } from "@/lib/utils"
+
+const Switch = React.forwardRef(({ className, ...props }, ref) => (
+  <SwitchPrimitives.Root
+    className={cn(
+      "peer inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:cursor-not-allowed disabled:opacity-50 data-[state=checked]:bg-primary data-[state=unchecked]:bg-input",
+      className
+    )}
+    {...props}
+    ref={ref}>
+    <SwitchPrimitives.Thumb
+      className={cn(
+        "pointer-events-none block h-4 w-4 rounded-full bg-background shadow-lg ring-0 transition-transform data-[state=checked]:translate-x-4 data-[state=unchecked]:translate-x-0"
+      )} />
+  </SwitchPrimitives.Root>
+))
+Switch.displayName = SwitchPrimitives.Root.displayName
+
+export { Switch }
+import * as React from "react"
+
+import { cn } from "@/lib/utils"
+
+const Table = React.forwardRef(({ className, ...props }, ref) => (
+  <div className="relative w-full overflow-auto">
+    <table
+      ref={ref}
+      className={cn("w-full caption-bottom text-sm", className)}
+      {...props} />
+  </div>
+))
+Table.displayName = "Table"
+
+const TableHeader = React.forwardRef(({ className, ...props }, ref) => (
+  <thead ref={ref} className={cn("[&_tr]:border-b", className)} {...props} />
+))
+TableHeader.displayName = "TableHeader"
+
+const TableBody = React.forwardRef(({ className, ...props }, ref) => (
+  <tbody
+    ref={ref}
+    className={cn("[&_tr:last-child]:border-0", className)}
+    {...props} />
+))
+TableBody.displayName = "TableBody"
+
+const TableFooter = React.forwardRef(({ className, ...props }, ref) => (
+  <tfoot
+    ref={ref}
+    className={cn("border-t bg-muted/50 font-medium [&>tr]:last:border-b-0", className)}
+    {...props} />
+))
+TableFooter.displayName = "TableFooter"
+
+const TableRow = React.forwardRef(({ className, ...props }, ref) => (
+  <tr
+    ref={ref}
+    className={cn(
+      "border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted",
+      className
+    )}
+    {...props} />
+))
+TableRow.displayName = "TableRow"
+
+const TableHead = React.forwardRef(({ className, ...props }, ref) => (
+  <th
+    ref={ref}
+    className={cn(
+      "h-10 px-2 text-left align-middle font-medium text-muted-foreground [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
+      className
+    )}
+    {...props} />
+))
+TableHead.displayName = "TableHead"
+
+const TableCell = React.forwardRef(({ className, ...props }, ref) => (
+  <td
+    ref={ref}
+    className={cn(
+      "p-2 align-middle [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
+      className
+    )}
+    {...props} />
+))
+TableCell.displayName = "TableCell"
+
+const TableCaption = React.forwardRef(({ className, ...props }, ref) => (
+  <caption
+    ref={ref}
+    className={cn("mt-4 text-sm text-muted-foreground", className)}
+    {...props} />
+))
+TableCaption.displayName = "TableCaption"
+
+export {
+  Table,
+  TableHeader,
+  TableBody,
+  TableFooter,
+  TableHead,
+  TableRow,
+  TableCell,
+  TableCaption,
+}
+import * as React from "react"
+import * as TabsPrimitive from "@radix-ui/react-tabs"
+
+import { cn } from "@/lib/utils"
+
+const Tabs = TabsPrimitive.Root
+
+const TabsList = React.forwardRef(({ className, ...props }, ref) => (
+  <TabsPrimitive.List
+    ref={ref}
+    className={cn(
+      "inline-flex h-9 items-center justify-center rounded-lg bg-muted p-1 text-muted-foreground",
+      className
+    )}
+    {...props} />
+))
+TabsList.displayName = TabsPrimitive.List.displayName
+
+const TabsTrigger = React.forwardRef(({ className, ...props }, ref) => (
+  <TabsPrimitive.Trigger
+    ref={ref}
+    className={cn(
+      "inline-flex items-center justify-center whitespace-nowrap rounded-md px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow",
+      className
+    )}
+    {...props} />
+))
+TabsTrigger.displayName = TabsPrimitive.Trigger.displayName
+
+const TabsContent = React.forwardRef(({ className, ...props }, ref) => (
+  <TabsPrimitive.Content
+    ref={ref}
+    className={cn(
+      "mt-2 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+      className
+    )}
+    {...props} />
+))
+TabsContent.displayName = TabsPrimitive.Content.displayName
+
+export { Tabs, TabsList, TabsTrigger, TabsContent }
+import * as React from "react"
+
+import { cn } from "@/lib/utils"
+
+const Textarea = React.forwardRef(({ className, ...props }, ref) => {
+  return (
+    (<textarea
+      className={cn(
+        "flex min-h-[60px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-base shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 md:text-sm",
+        className
+      )}
+      ref={ref}
+      {...props} />)
+  );
+})
+Textarea.displayName = "Textarea"
+
+export { Textarea }
+import * as React from "react";
+import * as ToastPrimitives from "@radix-ui/react-toast";
+import { cva } from "class-variance-authority";
+import { X } from "lucide-react";
+import { cn } from "@/lib/utils";
+
+const ToastProvider = ToastPrimitives.Provider;
+
+const ToastViewport = React.forwardRef(({ className, ...props }, ref) => (
+  <ToastPrimitives.Viewport
+    ref={ref}
+    className={cn(
+      "fixed top-0 z-[100] flex max-h-screen w-full flex-col-reverse p-4 sm:bottom-0 sm:right-0 sm:top-auto sm:flex-col md:max-w-[420px]",
+      className
+    )}
+    {...props}
+  />
+));
+ToastViewport.displayName = ToastPrimitives.Viewport.displayName;
+
+const toastVariants = cva(
+  "group pointer-events-auto relative flex w-full items-center justify-between space-x-4 overflow-hidden rounded-md border p-6 pr-8 shadow-lg transition-all data-[swipe=cancel]:translate-x-0 data-[swipe=end]:translate-x-[var(--radix-toast-swipe-end-x)] data-[swipe=move]:translate-x-[var(--radix-toast-swipe-move-x)] data-[swipe=move]:transition-none data-[state=open]:animate-in data-[state=closed]:animate-out data-[swipe=end]:animate-out data-[state=closed]:fade-out-80 data-[state=closed]:slide-out-to-right-full data-[state=open]:slide-in-from-top-full data-[state=open]:sm:slide-in-from-bottom-full",
+  {
+    variants: {
+      variant: {
+        default: "border bg-background text-foreground",
+        destructive:
+          "destructive group border-destructive bg-destructive text-destructive-foreground",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+    },
+  }
+);
+
+const Toast = React.forwardRef(({ className, variant, ...props }, ref) => {
+  return (
+    <ToastPrimitives.Root
+      ref={ref}
+      className={cn(toastVariants({ variant }), className)}
+      {...props}
+    />
+  );
+});
+Toast.displayName = ToastPrimitives.Root.displayName;
+
+const ToastAction = React.forwardRef(({ className, ...props }, ref) => (
+  <ToastPrimitives.Action
+    ref={ref}
+    className={cn(
+      "inline-flex h-8 shrink-0 items-center justify-center rounded-md border bg-transparent px-3 text-sm font-medium ring-offset-background transition-colors hover:bg-secondary focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 group-[.destructive]:border-muted/40 group-[.destructive]:hover:border-destructive/30 group-[.destructive]:hover:bg-destructive group-[.destructive]:hover:text-destructive-foreground group-[.destructive]:focus:ring-destructive",
+      className
+    )}
+    {...props}
+  />
+));
+ToastAction.displayName = ToastPrimitives.Action.displayName;
+
+const ToastClose = React.forwardRef(({ className, ...props }, ref) => (
+  <ToastPrimitives.Close
+    ref={ref}
+    className={cn(
+      "absolute right-2 top-2 rounded-md p-1 text-foreground/50 opacity-0 transition-opacity hover:text-foreground focus:opacity-100 focus:outline-none focus:ring-2 group-hover:opacity-100 group-[.destructive]:text-red-300 group-[.destructive]:hover:text-red-50 group-[.destructive]:focus:ring-red-400 group-[.destructive]:focus:ring-offset-red-600",
+      className
+    )}
+    toast-close=""
+    {...props}
+  >
+    <X className="h-4 w-4" />
+  </ToastPrimitives.Close>
+));
+ToastClose.displayName = ToastPrimitives.Close.displayName;
+
+const ToastTitle = React.forwardRef(({ className, ...props }, ref) => (
+  <ToastPrimitives.Title
+    ref={ref}
+    className={cn("text-sm font-semibold", className)}
+    {...props}
+  />
+));
+ToastTitle.displayName = ToastPrimitives.Title.displayName;
+
+const ToastDescription = React.forwardRef(({ className, ...props }, ref) => (
+  <ToastPrimitives.Description
+    ref={ref}
+    className={cn("text-sm opacity-90", className)}
+    {...props}
+  />
+));
+ToastDescription.displayName = ToastPrimitives.Description.displayName;
+
+export {
+  ToastProvider,
+  ToastViewport,
+  Toast,
+  ToastTitle,
+  ToastDescription,
+  ToastClose,
+  ToastAction,
+};
+import { useToast } from "@/components/ui/use-toast";
+import {
+  Toast,
+  ToastClose,
+  ToastDescription,
+  ToastProvider,
+  ToastTitle,
+  ToastViewport,
+} from "@/components/ui/toast";
+
+export function Toaster() {
+  const { toasts } = useToast();
+
+  return (
+    <ToastProvider>
+      {toasts.map(function ({ id, title, description, action, ...props }) {
+        return (
+          <Toast key={id} {...props}>
+            <div className="grid gap-1">
+              {title && <ToastTitle>{title}</ToastTitle>}
+              {description && (
+                <ToastDescription>{description}</ToastDescription>
+              )}
+            </div>
+            {action}
+            <ToastClose />
+          </Toast>
+        );
+      })}
+      <ToastViewport />
+    </ToastProvider>
+  );
+} 
+"use client";
+import * as React from "react"
+import * as ToggleGroupPrimitive from "@radix-ui/react-toggle-group"
+
+import { cn } from "@/lib/utils"
+import { toggleVariants } from "@/components/ui/toggle"
+
+const ToggleGroupContext = React.createContext({
+  size: "default",
+  variant: "default",
+})
+
+const ToggleGroup = React.forwardRef(({ className, variant, size, children, ...props }, ref) => (
+  <ToggleGroupPrimitive.Root
+    ref={ref}
+    className={cn("flex items-center justify-center gap-1", className)}
+    {...props}>
+    <ToggleGroupContext.Provider value={{ variant, size }}>
+      {children}
+    </ToggleGroupContext.Provider>
+  </ToggleGroupPrimitive.Root>
+))
+
+ToggleGroup.displayName = ToggleGroupPrimitive.Root.displayName
+
+const ToggleGroupItem = React.forwardRef(({ className, children, variant, size, ...props }, ref) => {
+  const context = React.useContext(ToggleGroupContext)
+
+  return (
+    (<ToggleGroupPrimitive.Item
+      ref={ref}
+      className={cn(toggleVariants({
+        variant: context.variant || variant,
+        size: context.size || size,
+      }), className)}
+      {...props}>
+      {children}
+    </ToggleGroupPrimitive.Item>)
+  );
+})
+
+ToggleGroupItem.displayName = ToggleGroupPrimitive.Item.displayName
+
+export { ToggleGroup, ToggleGroupItem }
+import * as React from "react"
+import * as TogglePrimitive from "@radix-ui/react-toggle"
+import { cva } from "class-variance-authority";
+
+import { cn } from "@/lib/utils"
+
+const toggleVariants = cva(
+  "inline-flex items-center justify-center gap-2 rounded-md text-sm font-medium transition-colors hover:bg-muted hover:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 data-[state=on]:bg-accent data-[state=on]:text-accent-foreground [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+  {
+    variants: {
+      variant: {
+        default: "bg-transparent",
+        outline:
+          "border border-input bg-transparent shadow-sm hover:bg-accent hover:text-accent-foreground",
+      },
+      size: {
+        default: "h-9 px-2 min-w-9",
+        sm: "h-8 px-1.5 min-w-8",
+        lg: "h-10 px-2.5 min-w-10",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+      size: "default",
+    },
+  }
+)
+
+const Toggle = React.forwardRef(({ className, variant, size, ...props }, ref) => (
+  <TogglePrimitive.Root
+    ref={ref}
+    className={cn(toggleVariants({ variant, size, className }))}
+    {...props} />
+))
+
+Toggle.displayName = TogglePrimitive.Root.displayName
+
+export { Toggle, toggleVariants }
+"use client"
+
+import * as React from "react"
+import * as TooltipPrimitive from "@radix-ui/react-tooltip"
+
+import { cn } from "@/lib/utils"
+
+const TooltipProvider = TooltipPrimitive.Provider
+
+const Tooltip = TooltipPrimitive.Root
+
+const TooltipTrigger = TooltipPrimitive.Trigger
+
+const TooltipContent = React.forwardRef(({ className, sideOffset = 4, ...props }, ref) => (
+  <TooltipPrimitive.Portal>
+    <TooltipPrimitive.Content
+      ref={ref}
+      sideOffset={sideOffset}
+      className={cn(
+        "z-50 overflow-hidden rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+        className
+      )}
+      {...props} />
+  </TooltipPrimitive.Portal>
+))
+TooltipContent.displayName = TooltipPrimitive.Content.displayName
+
+export { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider }
+import * as React from "react"
+import { useSize } from "../../hooks/use-size"
+import { cn } from "../../lib/utils"
+import { DEFAULT_TRANSFORM_WIDTH, getImagePreviewClassName } from "./image-helpers"
+
+export function useResponsiveImage({ parsed, fittingType, focalPoint, quality, className, onLoad, onSourceChange }, parentRef) {
+  const wrapperRef = React.useRef(null)
+  const imgRef = React.useRef(null)
+  const size = useSize(wrapperRef)
+  const [loaded, setLoaded] = React.useState(false)
+
+  React.useImperativeHandle(parentRef, () => imgRef.current)
+  React.useEffect(() => setLoaded(false), [parsed.baseUrl])
+  React.useEffect(() => {
+    const wrapper = wrapperRef.current
+    const replace = (event) => onSourceChange(
+      event.detail.src, getImagePreviewClassName(className, wrapper.className, cn("inline-block relative", className))
+    )
+    wrapper.addEventListener("base44:image-replace", replace)
+    return () => wrapper.removeEventListener("base44:image-replace", replace)
+  }, [className, onSourceChange])
+
+  const crop = fittingType !== "fit"
+  // Wait for useSize's pre-paint measurement before requesting a transform.
+  const options = size && {
+    width: size.width || DEFAULT_TRANSFORM_WIDTH,
+    height: size.height || undefined,
+    crop,
+    focalPoint: crop ? focalPoint : undefined,
+    quality,
+  }
+
+  return {
+    wrapperRef, imgRef, loaded, options,
+    handleLoad: (event) => {
+      setLoaded(true)
+      onLoad?.(event)
+    },
+  }
+}
+// Inspired by react-hot-toast library
+import { useState, useEffect } from "react";
+
+const TOAST_LIMIT = 20;
+const TOAST_REMOVE_DELAY = 1000000;
+
+const actionTypes = {
+  ADD_TOAST: "ADD_TOAST",
+  UPDATE_TOAST: "UPDATE_TOAST",
+  DISMISS_TOAST: "DISMISS_TOAST",
+  REMOVE_TOAST: "REMOVE_TOAST",
+};
+
+let count = 0;
+
+function genId() {
+  count = (count + 1) % Number.MAX_VALUE;
+  return count.toString();
+}
+
+const toastTimeouts = new Map();
+
+const addToRemoveQueue = (toastId) => {
+  if (toastTimeouts.has(toastId)) {
+    return;
+  }
+
+  const timeout = setTimeout(() => {
+    toastTimeouts.delete(toastId);
+    dispatch({
+      type: actionTypes.REMOVE_TOAST,
+      toastId,
+    });
+  }, TOAST_REMOVE_DELAY);
+
+  toastTimeouts.set(toastId, timeout);
+};
+
+const _clearFromRemoveQueue = (toastId) => {
+  const timeout = toastTimeouts.get(toastId);
+  if (timeout) {
+    clearTimeout(timeout);
+    toastTimeouts.delete(toastId);
+  }
+};
+
+export const reducer = (state, action) => {
+  switch (action.type) {
+    case actionTypes.ADD_TOAST:
+      return {
+        ...state,
+        toasts: [action.toast, ...state.toasts].slice(0, TOAST_LIMIT),
+      };
+
+    case actionTypes.UPDATE_TOAST:
+      return {
+        ...state,
+        toasts: state.toasts.map((t) =>
+          t.id === action.toast.id ? { ...t, ...action.toast } : t
+        ),
+      };
+
+    case actionTypes.DISMISS_TOAST: {
+      const { toastId } = action;
+
+      // ! Side effects ! - This could be extracted into a dismissToast() action,
+      // but I'll keep it here for simplicity
+      if (toastId) {
+        addToRemoveQueue(toastId);
+      } else {
+        state.toasts.forEach((toast) => {
+          addToRemoveQueue(toast.id);
+        });
+      }
+
+      return {
+        ...state,
+        toasts: state.toasts.map((t) =>
+          t.id === toastId || toastId === undefined
+            ? {
+                ...t,
+                open: false,
+              }
+            : t
+        ),
+      };
+    }
+    case actionTypes.REMOVE_TOAST:
+      if (action.toastId === undefined) {
+        return {
+          ...state,
+          toasts: [],
+        };
+      }
+      return {
+        ...state,
+        toasts: state.toasts.filter((t) => t.id !== action.toastId),
+      };
+  }
+};
+
+const listeners = [];
+
+let memoryState = { toasts: [] };
+
+function dispatch(action) {
+  memoryState = reducer(memoryState, action);
+  listeners.forEach((listener) => {
+    listener(memoryState);
+  });
+}
+
+function toast({ ...props }) {
+  const id = genId();
+
+  const update = (props) =>
+    dispatch({
+      type: actionTypes.UPDATE_TOAST,
+      toast: { ...props, id },
+    });
+
+  const dismiss = () =>
+    dispatch({ type: actionTypes.DISMISS_TOAST, toastId: id });
+
+  dispatch({
+    type: actionTypes.ADD_TOAST,
+    toast: {
+      ...props,
+      id,
+      open: true,
+      onOpenChange: (open) => {
+        if (!open) dismiss();
+      },
+    },
+  });
+
+  return {
+    id,
+    dismiss,
+    update,
+  };
+}
+
+function useToast() {
+  const [state, setState] = useState(memoryState);
+
+  useEffect(() => {
+    listeners.push(setState);
+    return () => {
+      const index = listeners.indexOf(setState);
+      if (index > -1) {
+        listeners.splice(index, 1);
+      }
+    };
+  }, [state]);
+
+  return {
+    ...state,
+    toast,
+    dismiss: (toastId) => dispatch({ type: actionTypes.DISMISS_TOAST, toastId }),
+  };
+}
+
+export { useToast, toast }; 
+import { ErrorComponent, Link, rootRouteId, useMatch, useRouter } from "@tanstack/react-router";
+import { Button } from "@/components/ui/button";
+
+export function DefaultCatchBoundary({ error }) {
+  const router = useRouter();
+  const isRoot = useMatch({ strict: false, select: (state) => state.id === rootRouteId });
+
+  return (
+    <div className="mx-auto flex max-w-2xl flex-col items-center gap-4 py-24">
+      <ErrorComponent error={error} />
+      <div className="flex gap-2">
+        <Button variant="outline" onClick={() => router.invalidate()}>
+          Try again
+        </Button>
+        <Button asChild>{isRoot ? <Link to="/">Home</Link> : <Link to="/" onClick={(e) => { e.preventDefault(); window.history.back(); }}>Go back</Link>}</Button>
+      </div>
+    </div>
+  );
+}
+import { Link } from "@tanstack/react-router";
+import { Button } from "@/components/ui/button";
+
+export function NotFound({ children }) {
+  return (
+    <div className="mx-auto flex max-w-lg flex-col items-center gap-4 py-24 text-center">
+      <p className="text-6xl font-semibold tracking-tight">404</p>
+      <p className="text-muted-foreground">{children ?? "The page you are looking for does not exist."}</p>
+      <div className="flex gap-2">
+        <Button variant="outline" onClick={() => window.history.back()}>
+          Go back
+        </Button>
+        <Button asChild>
+          <Link to="/">Start over</Link>
+        </Button>
+      </div>
+    </div>
+  );
+}
+import * as React from "react"
+
+const MOBILE_BREAKPOINT = 768
+
+export function useIsMobile() {
+  const [isMobile, setIsMobile] = React.useState(undefined)
+
+  React.useEffect(() => {
+    const mql = window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT - 1}px)`)
+    const onChange = () => {
+      setIsMobile(window.innerWidth < MOBILE_BREAKPOINT)
+    }
+    mql.addEventListener("change", onChange)
+    setIsMobile(window.innerWidth < MOBILE_BREAKPOINT)
+    return () => mql.removeEventListener("change", onChange);
+  }, [])
+
+  return !!isMobile
+}
+import * as React from "react"
+
+export function useSize(ref) {
+  const [size, setSize] = React.useState(null)
+
+  // useLayoutEffect (not useEffect): the initial measurement must land before
+  // the browser paints, so consumers can render their real content on the
+  // very first painted frame instead of a guess. A ResizeObserver's first
+  // callback arrives too late for that — by then an <img> src guess has
+  // already been dispatched to the network.
+  React.useLayoutEffect(() => {
+    const element = ref.current
+    if (!element) return
+
+    const rect = element.getBoundingClientRect()
+    setSize({ width: rect.width, height: rect.height })
+
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect
+      setSize({ width, height })
+    })
+
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [ref])
+
+  return size
+}
+import { openaiCompatibleText } from "@tanstack/ai-openai/compatible";
+
+// A TanStack AI chat adapter on the Base44 AI gateway: OpenAI-compatible, no API
+// key, billed to the app's AI credits. Pass `context.getBase44()`. The gateway is
+// called as the app (service role) because an owner can restrict it to server-side
+// calls, which refuses a visitor's token, so authenticate the caller first.
+// "automatic" lets the platform pick the model; named models cost more credits.
+export const gatewayModel = (base44, model = "automatic") => {
+  const { baseURL, token, headers } = base44.asServiceRole.aiGateway.connection();
+  return openaiCompatibleText(model, { name: "base44", baseURL, apiKey: token, defaultHeaders: headers });
+};
+import { getAccessToken } from "@base44/sdk";
+
+const isBrowser = typeof window !== "undefined";
+
+const isClearAccessTokenRequested = () =>
+  isBrowser && new URLSearchParams(window.location.search).get("clear_access_token") === "true";
+
+const clearStoredAccessToken = () => {
+  window.localStorage.removeItem("base44_access_token");
+  window.localStorage.removeItem("token");
+};
+
+export function getAppParams() {
+  if (isClearAccessTokenRequested()) clearStoredAccessToken();
+  return {
+    appId: import.meta.env.VITE_BASE44_APP_ID,
+    token: isBrowser ? getAccessToken() : null,
+    functionsVersion: (isBrowser && new URLSearchParams(window.location.search).get("functions_version")?.trim()) || import.meta.env.VITE_BASE44_FUNCTIONS_VERSION,
+    appBaseUrl: import.meta.env.VITE_BASE44_APP_BASE_URL,
+  };
+}
+import { createClientFromRequest, getAccessToken } from "@base44/sdk";
+import { createMiddleware } from "@tanstack/react-start";
+import { getRequest, setResponseStatus } from "@tanstack/react-start/server";
+
+// Both middlewares hand handlers the same lazy `context.getBase44()`: a
+// function, not the client, because the client needs the platform headers and
+// a handler that never touches Base44 must still answer without them. The
+// platform sets those headers on every request that reaches the server; a
+// visitor's Authorization header makes the client act as that visitor.
+const withGetBase44 = (next, request = getRequest()) => {
+  let client;
+  return next({ context: { getBase44: () => (client ??= createClientFromRequest(request)) } });
+};
+
+// Applied to every server function by src/start.js: sends the visitor's Base44
+// access token with the call so `context.getBase44()` acts as the visitor (entity
+// access rules apply). Anonymous visitors send nothing and get an anonymous client.
+export const authMiddleware = createMiddleware({ type: "function" })
+  .client(async ({ next }) => {
+    const token = typeof window === "undefined" ? null : getAccessToken();
+    return next({ headers: token ? { Authorization: `Bearer ${token}` } : {} });
+  })
+  .server(({ next }) => withGetBase44(next));
+
+// Applied to every request by src/start.js, so a server route handler
+// (`server.handlers`) receives the same `context.getBase44()` as a server function.
+export const base44RequestMiddleware = createMiddleware({ type: "request" }).server(({ next, request }) =>
+  withGetBase44(next, request),
+);
+
+// Only an auth rejection means "not signed in"; outages and rate limits propagate as themselves.
+const currentUser = (context) =>
+  context
+    .getBase44()
+    .auth.me()
+    .catch((error) => {
+      if (error?.status === 401 || error?.status === 403) return null;
+      throw error;
+    });
+
+// Neither middleware authenticates anyone. Add this to a server function that
+// needs a signed-in caller; it rejects anonymous callers and sets `context.user`:
+//   createServerFn().middleware([requireUser]).handler(({ context }) => context.user.id)
+export const requireUser = createMiddleware({ type: "function" }).server(async ({ next, context }) => {
+  const user = await currentUser(context);
+  if (!user) {
+    setResponseStatus(401);
+    throw Object.assign(new Error("Unauthorized"), { status: 401, code: "UNAUTHORIZED" });
+  }
+  return next({ context: { user } });
+});
+
+// The same for a server route: `server: { middleware: [requireUserRoute], handlers }` answers
+// anonymous callers with 401 and sets `context.user`. Only on src/routes/api/* files: a route's
+// middleware also runs for every route under it, and page navigations carry no token.
+export const requireUserRoute = createMiddleware({ type: "request" }).server(async ({ next, context }) => {
+  const user = await currentUser(context);
+  if (!user) return Response.json({ error: "Unauthorized" }, { status: 401 });
+  return next({ context: { user } });
+});
+import { queryOptions, useQuery, useQueryClient } from "@tanstack/react-query";
+import { createContext, useContext, useMemo } from "react";
+import { base44 } from "@/api/base44Client";
+import { currentUrl } from "@/lib/authReturnTo";
+
+/**
+ * The visitor, resolved once per page load and cached in the router's QueryClient:
+ * the login gate (src/components/auth/AuthGate.jsx) reads it with
+ * `context.queryClient.ensureQueryData(authQuery)`, components with `useAuth()`.
+ * Resolves to `{ user, error }`: an anonymous visitor (no token, or a 401/403) is `{ user: null, error: null }`.
+ * Anything else, an outage (429, 503) or a request that never got an answer, rejects instead,
+ * so it is never cached as "signed out" and the next read asks again.
+ */
+export const authQuery = queryOptions({
+  queryKey: ["auth", "me"],
+  queryFn: async () => {
+    // No token means no session; /me could only answer 401.
+    if (!base44.auth.hasToken()) return { user: null, error: null };
+    try {
+      return { user: await base44.auth.me(), error: null };
+    } catch (err) {
+      if (err?.data?.extra_data?.reason === "user_not_registered") {
+        return { user: null, error: { type: "user_not_registered", message: "Not registered" } };
+      }
+      if (err?.status === 401 || err?.status === 403) return { user: null, error: null };
+      throw err;
+    }
+  },
+  staleTime: Infinity,
+  retry: false,
+});
+
+const AuthContext = createContext(null);
+
+/**
+ * Client-side session state. The server renders every page anonymously and the
+ * query only runs in the browser after hydration, so the first client render
+ * matches the server markup. Gate user-specific UI on `isLoadingAuth`.
+ */
+export function AuthProvider({ children }) {
+  const queryClient = useQueryClient();
+  const { data, error, isPending } = useQuery(authQuery);
+
+  const value = useMemo(
+    () => ({
+      user: data?.user ?? null,
+      isAuthenticated: !!data?.user,
+      isLoadingAuth: isPending,
+      authError: data?.error ?? (error ? { type: "unknown", message: error.message ?? "Failed to load session" } : null),
+      refresh: () => queryClient.fetchQuery({ ...authQuery, staleTime: 0 }),
+      logout: () => {
+        queryClient.setQueryData(authQuery.queryKey, { user: null, error: null });
+        base44.auth.logout(window.location.origin);
+      },
+      // Full-page sign-in: /login with the current page as the way back. A hard
+      // navigation on purpose — on an app served behind the platform login the
+      // platform answers /login itself; an app with its own auth pages serves its /login route.
+      navigateToLogin: () => base44.auth.redirectToLogin(currentUrl()),
+    }),
+    [data, error, isPending, queryClient],
+  );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth must be used within <AuthProvider>");
+  return ctx;
+}
+import { base44 } from "@/api/base44Client";
+import { getAppParams } from "@/lib/app-params";
+
+const appId = () => getAppParams().appId;
+
+function authPath(suffix) {
+  if (!/^[a-f0-9]{24}$/i.test(appId())) throw new Error("Invalid app ID");
+  return `/api/apps/${appId()}/auth/${suffix}`;
+}
+
+async function post(suffix, body, token) {
+  const response = await fetch(authPath(suffix), {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(body),
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error?.message || result.detail || "Unable to sign in");
+  return result;
+}
+
+export async function loginWithMfa(email, password) {
+  const result = await post("login", { email, password });
+  if (result.access_token) base44.auth.setToken(result.access_token);
+  return result;
+}
+
+export async function continueMfa(result, returnTo) {
+  const encode = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const verifier = encode(crypto.getRandomValues(new Uint8Array(32)));
+  const challenge = encode(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))));
+  const { code } = await post("mfa/handoff", { code_challenge: challenge }, result.mfa_session_token);
+  sessionStorage.setItem(`app-mfa-pkce:${appId()}`, verifier);
+  const url = new URL("/auth/mfa", window.location.origin);
+  url.search = new URLSearchParams({ app_id: appId(), mfa_code: code, from_url: returnTo });
+  window.location.assign(url.href);
+}
+
+// provider: "google" | "microsoft" | "facebook" | "apple"
+export async function loginWithSocial(provider, returnTo) {
+  const response = await fetch(`/api/apps/public/login-info/by-id/${appId()}`);
+  if (!response.ok) throw new Error("Unable to load sign-in options");
+  const info = await response.json();
+  if (info.auth_config?.mfa_policy !== "required") return base44.auth.loginWithProvider(provider, returnTo);
+  const url = new URL("/auth/mfa", window.location.origin);
+  url.search = new URLSearchParams({ app_id: appId(), oauth_start: provider, from_url: returnTo });
+  window.location.assign(url.href);
+}
+
+export function loginWithGoogle(returnTo) {
+  return loginWithSocial("google", returnTo);
+}
+import { base44 } from '@/api/base44Client';
+import { getAppParams } from '@/lib/app-params';
+
+const appId = () => getAppParams().appId;
+
+// The app's own MFA: sign-in challenge, enrollment and factor management, against the app's
+// /api/apps/<id>/auth/mfa routes. Credentials stay in memory, never in the URL or storage.
+
+const PKCE_KEY = () => `app-mfa-pkce:${appId()}`;
+const encode = bytes => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+export class MfaError extends Error {
+  constructor(message, status, retryAfter) {
+    super(message);
+    this.status = status;
+    this.retryAfter = retryAfter;
+  }
+  // The challenge or grant is gone (expired or used up): sign in again. A 409 is either a concurrent
+  // change or the last-method guard; its message says which, so it gets no sign-in link.
+  get mustSignInAgain() {
+    return this.status === 401;
+  }
+}
+
+function authPath(suffix) {
+  if (!/^[a-f0-9]{24}$/i.test(appId())) throw new Error('Invalid app ID');
+  return `/api/apps/${appId()}/auth/${suffix}`;
+}
+
+async function request(suffix, { method = 'POST', body, token, headers } = {}) {
+  const response = await fetch(authPath(suffix), {
+    method,
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = result.error?.message || result.detail || 'Something went wrong. Try again.';
+    throw new MfaError(message, response.status, Number(response.headers.get('Retry-After')) || null);
+  }
+  return result;
+}
+
+// One MFA credential (sign-in challenge, then the management grant) and every call made with it.
+// Each success may rotate the grant and revoke older sessions, so both are swapped every time.
+export function mfaSession(challenge) {
+  let credential = challenge.mfa_session_token;
+  const call = async (suffix, body, method) => {
+    const result = await request(`mfa/${suffix}`, { method, body, token: credential });
+    if (result.mfa_management_token) credential = result.mfa_management_token;
+    if (result.access_token) base44.auth.setToken(result.access_token);
+    return result;
+  };
+  return {
+    // Sign-in with an enrolled method. method: 'totp' | 'sms'
+    verify: (code, method, rememberDevice) => call('verify', { code, method, remember_device: rememberDevice }),
+    sendSignInCode: () => call('resend'),
+    // Enrollment, and adding or replacing a method during management.
+    setupAuthenticator: () => call('totp/setup', {}),
+    confirmAuthenticator: (code, rememberDevice = false) => call('totp/verify', { code, remember_device: rememberDevice }),
+    sendPhoneCode: phoneNumber => call('sms/send-code', { phone_number: phoneNumber }),
+    confirmPhone: (code, rememberDevice = false) => call('sms/verify', { code, remember_device: rememberDevice }),
+    // Management only.
+    status: () => call('status', undefined, 'GET'),
+    sendProofCode: () => call('sms/send-code', { phone_number: '' }),
+    removeMethod: (method, code, proofMethod) => call('disable', { method, code, verification_method: proofMethod }),
+    forgetDevices: (code, proofMethod) => call('trusted-devices/clear', { code, method: proofMethod }),
+  };
+}
+
+// Password sign-in that opens factor management instead of signing in.
+export function signInToManageMfa(email, password) {
+  return request('login', { body: { email, password }, headers: { 'X-App-Mfa-Action': 'manage' } });
+}
+
+let resumed;
+
+// Picks up the challenge a social or SSO sign-in sends back to /mfa?mfa_code=…
+export function resumeMfa() {
+  // The code works once, so a second call (e.g. React StrictMode) reuses the first exchange.
+  resumed ||= (async () => {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('mfa_code');
+    if (!code) return null;
+    const verifier = sessionStorage.getItem(PKCE_KEY());
+    sessionStorage.removeItem(PKCE_KEY());
+    params.delete('mfa_code');
+    const rest = params.toString();
+    window.history.replaceState(null, '', `${window.location.pathname}${rest ? `?${rest}` : ''}`);
+    const result = await request('mfa/exchange', { body: { code, code_verifier: verifier } });
+    if (result.access_token) base44.auth.setToken(result.access_token);
+    return result;
+  })();
+  return resumed;
+}
+
+const isInAppBrowser = () => /LinkedIn|Twitter/i.test(navigator.userAgent);
+
+// The app's sign-in settings: auth_config holds mfa_policy and the enabled sign-in methods.
+export async function loadSignInOptions() {
+  const response = await fetch(`/api/apps/public/login-info/by-id/${appId()}`);
+  if (!response.ok) throw new Error('Unable to load sign-in options');
+  return response.json();
+}
+
+// provider: 'google' | 'microsoft' | 'facebook' | 'apple' | 'sso'. With manage, the sign-in opens
+// factor management. Returns to this app's /mfa page when MFA is needed.
+export async function signInWithProvider(provider, returnTo, { manage = false } = {}) {
+  const info = await loadSignInOptions();
+  // Enterprise SSO sign-in is exempt from Base44 MFA; only managing factors asks for it.
+  if (!manage && (info.auth_config?.mfa_policy !== 'required' || provider === 'sso')) {
+    return base44.auth.loginWithProvider(provider, returnTo);
+  }
+  if (isInAppBrowser()) {
+    // In-app browsers hand sign-in to the system browser through the platform's MFA page.
+    const url = new URL('/auth/mfa', window.location.origin);
+    url.search = new URLSearchParams({ app_id: appId(), oauth_start: provider, from_url: returnTo, ...(manage ? { security: '1' } : {}) });
+    window.location.assign(url.href);
+    return;
+  }
+  const verifier = encode(crypto.getRandomValues(new Uint8Array(32)));
+  const challenge = encode(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))));
+  sessionStorage.setItem(PKCE_KEY(), verifier);
+  const workspaceSso = provider === 'sso' && info.auth_config?.use_workspace_sso && info.organization_id;
+  const path = provider === 'sso'
+    ? (workspaceSso ? `/api/apps/${info.organization_id}/${appId()}/auth/sso/login` : `/api/apps/${appId()}/auth/sso/login`)
+    : `/api/apps/auth${provider === 'google' ? '' : `/${provider}`}/login`;
+  const url = new URL(path, window.location.origin);
+  url.search = new URLSearchParams({
+    from_url: new URL(returnTo, window.location.origin).href,
+    ...(workspaceSso ? {} : { app_id: appId() }),
+    ...(manage ? { app_mfa_action: 'manage' } : {}),
+    app_mfa_code_challenge: challenge,
+    app_mfa_return: '/mfa',
+  });
+  window.location.assign(url.href);
+}
+
+// After MFA: a popup sign-in hands the session to the window that opened it; otherwise go on.
+export function finishSignIn(accessToken, returnTo) {
+  if (new URLSearchParams(window.location.search).get('popup') === '1' && window.opener) {
+    window.opener.postMessage({ access_token: accessToken }, window.location.origin);
+    window.close();
+    return;
+  }
+  window.location.href = returnTo;
+}
+// Post-auth destination, shared by the auth pages and the MCP consent page.
+// Keep the check in one place — it is security-sensitive.
+//
+// Reads ?returnTo= (our pages) or ?from_url= (what the platform's redirectToLogin
+// and login-gate redirects send). A same-origin check alone is not enough: a
+// value like "/.//evil.com" or "/\evil.com" parses same-origin but normalizes
+// to a protocol-relative "//evil.com" when assigned to location.href, so the
+// resolved path must start with exactly one "/" and contain no backslash.
+//
+// An auth page is never a destination: coming back to /reset-password?token=…
+// would carry a live one-time credential through the login round-trip (and,
+// via Google, into the provider's OAuth state), and the other three would just
+// loop. `/oauth/consent` is a legitimate destination and is not in this set.
+const AUTH_PAGES = new Set(["/login", "/register", "/forgot-password", "/reset-password"]);
+
+export function safeReturnTo(search) {
+  if (typeof window === "undefined") return "/";
+  const params = new URLSearchParams(search ?? window.location.search);
+  return sanitizeReturnTo(params.get("returnTo") || params.get("from_url"));
+}
+
+export function sanitizeReturnTo(raw) {
+  if (!raw || typeof window === "undefined") return "/";
+  try {
+    const url = new URL(raw, window.location.origin);
+    if (url.origin !== window.location.origin) return "/";
+    // Bootstrap params must never ride through a login round-trip and get
+    // persisted into the fresh session. App-flow params (e.g. the consent ctx) stay.
+    for (const p of ["access_token", "clear_access_token", "app_id", "app_base_url", "functions_version", "from_url", "returnTo"]) {
+      url.searchParams.delete(p);
+    }
+    if (AUTH_PAGES.has(url.pathname.replace(/\/+$/, "") || "/")) return "/";
+    const path = url.pathname + url.search;
+    if (!path.startsWith("/") || path.startsWith("//") || path.includes("\\")) return "/";
+    return path;
+  } catch {
+    return "/";
+  }
+}
+
+// The current page as a returnTo value: same rules as any other destination, so
+// an auth page or a bootstrap param never becomes the way back.
+export function currentPath() {
+  if (typeof window === "undefined") return "/";
+  return sanitizeReturnTo(window.location.pathname + window.location.search);
+}
+
+// The current page as the absolute URL the platform login's from_url expects.
+export function currentUrl() {
+  if (typeof window === "undefined") return "/";
+  return window.location.origin + currentPath();
+}
+
+// `search` for a <Link> to an auth page that should come back to `returnTo`.
+export function returnToSearch(returnTo) {
+  return returnTo && returnTo !== "/" ? { returnTo } : {};
+}
+// Base44 managed file: error-capture v1. Keep it as it is, and keep both middlewares first in src/start.js;
+// Base44 replaces it with newer versions. Each reports the error to Base44 and rethrows it, and a 5xx response the
+// app returned goes out as it is, so what a visitor gets back is unchanged.
+import { isNotFound, isRedirect } from "@tanstack/react-router";
+import { createMiddleware } from "@tanstack/react-start";
+import { recordErrorResponse, recordFunctionError, recordRequestError } from "@/lib/error-capture.server";
+
+// Control flow, not failures: TanStack turns these into redirects, not-found pages and the thrown response.
+const isControlFlow = (error) => error instanceof Response || isRedirect(error) || isNotFound(error);
+
+// A server function's error, before TanStack serializes it for the caller.
+export const errorCaptureFunctionMiddleware = createMiddleware({ type: "function" }).server(
+  async ({ next, serverFnMeta }) => {
+    try {
+      return await next();
+    } catch (error) {
+      if (!isControlFlow(error)) recordFunctionError(error, serverFnMeta);
+      throw error;
+    }
+  },
+);
+
+// An error that escapes a server route, another middleware or the page's rendering, and a 5xx one of them returns.
+// A server function call's own errors come from the function middleware; what else escapes one is TanStack's (an
+// unknown function id).
+export const errorCaptureRequestMiddleware = createMiddleware({ type: "request" }).server(
+  async ({ next, request, handlerType }) => {
+    let result;
+    try {
+      result = await next();
+    } catch (error) {
+      if (handlerType !== "serverFn" && !isControlFlow(error)) recordRequestError(request, error);
+      throw error;
+    }
+    if (handlerType !== "serverFn") recordErrorResponse(request, result);
+    return result;
+  },
+);
+// Base44 managed file: error-capture v1. Keep it as it is; Base44 replaces it with newer versions.
+// It reports the app's server errors to Base44, so the app's owner sees them as alerts.
+import { getRequest, getResponseStatus } from "@tanstack/react-start/server";
+import { env, waitUntil } from "cloudflare:workers";
+
+// Base44 sends it only on production requests of apps whose owner turned error reporting on.
+const FEED_CONTEXT_HEADER = "x-b44-feed-context";
+const SECRET_MIN_CHARS = 8;
+const NAME_MAX_CHARS = 64;
+const MESSAGE_MAX_BYTES = 500;
+const STACK_MAX_BYTES = 4 * 1024;
+const LOGGED_ERRORS_KEPT = 8;
+const BODY_MAX_BYTES = 2 * 1024;
+const BODY_WAIT_MS = 50;
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+// The errors each request recorded. One error can surface twice: a server function's error also fails the loader
+// that called it. Per request, since requests can share an Error, such as a rejected init promise. A request with a
+// record gets none for the 5xx it then answers.
+const recorded = new WeakMap();
+// The Errors each stamped request logged, newest last.
+const loggedErrors = new WeakMap();
+
+function cutBytes(text, maxBytes) {
+  const bytes = encoder.encode(text);
+  if (bytes.length <= maxBytes) return text;
+  let end = maxBytes;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+  return decoder.decode(bytes.subarray(0, end));
+}
+
+function cutStack(stack) {
+  const cut = cutBytes(stack, STACK_MAX_BYTES);
+  const lineEnd = cut === stack ? -1 : cut.lastIndexOf("\n");
+  return lineEnd > 0 ? cut.slice(0, lineEnd) : cut;
+}
+
+function scrubber() {
+  const secrets = Object.values(env)
+    .filter((value) => typeof value === "string" && value.length >= SECRET_MIN_CHARS)
+    .sort((a, b) => b.length - a.length);
+  return (text) => secrets.reduce((scrubbed, secret) => scrubbed.replaceAll(secret, "[redacted]"), text.toWellFormed());
+}
+
+// One `_b44_error` record for Base44's error tail. A 4xx is the caller's, and an error without a message says
+// nothing: neither is recorded.
+function write(request, error, { status, fn, route }) {
+  if (status < 500 || !request.headers.has(FEED_CONTEXT_HEADER) || request.signal.aborted) return;
+  const seen = recorded.get(request);
+  if (seen?.has(error)) return;
+  const raw = typeof error === "string" ? error : error?.message;
+  if (typeof raw !== "string" || !raw.trim()) return;
+  const scrub = scrubber();
+  const record = {
+    v: 1,
+    kind: "response",
+    status,
+    name: typeof error?.name === "string" ? Array.from(scrub(error.name)).slice(0, NAME_MAX_CHARS).join("") : undefined,
+    message: cutBytes(scrub(raw), MESSAGE_MAX_BYTES),
+    stack: typeof error?.stack === "string" ? cutStack(scrub(error.stack)) : undefined,
+    fn,
+    route,
+  };
+  const line = { _b44_env: "prod", level: "error", message: JSON.stringify({ _b44_error: record }) };
+  recorded.set(request, (seen ?? new Set()).add(error));
+  console.log(line);
+}
+
+// Reporting never changes the request: any failure writes nothing.
+function safely(report) {
+  try {
+    report();
+  } catch {
+    // Nothing to do.
+  }
+}
+
+function stampedRequest() {
+  try {
+    const request = getRequest();
+    return request.headers.has(FEED_CONTEXT_HEADER) ? request : undefined;
+  } catch {
+    return undefined; // Not inside a request.
+  }
+}
+
+function remember(args) {
+  const request = stampedRequest();
+  if (!request) return;
+  const errors = args.filter((arg) => arg instanceof Error);
+  if (errors.length === 0) return;
+  loggedErrors.set(request, [...(loggedErrors.get(request) ?? []), ...errors].slice(-LOGGED_ERRORS_KEPT));
+}
+
+// A 5xx the app answers itself is described from the Errors it logged.
+for (const method of ["debug", "dir", "error", "info", "log", "trace", "warn"]) {
+  const original = console[method];
+  console[method] = (...args) => {
+    safely(() => remember(args));
+    return original.apply(console, args);
+  };
+}
+
+// The body as JSON, if it is at most BODY_MAX_BYTES and arrives within BODY_WAIT_MS.
+async function readJson(response) {
+  const reader = response.body?.getReader();
+  if (!reader) return undefined;
+  let timer;
+  const late = new Promise((resolve) => (timer = setTimeout(resolve, BODY_WAIT_MS)));
+  try {
+    const chunks = [];
+    let size = 0;
+    for (;;) {
+      const read = await Promise.race([reader.read(), late]);
+      if (!read) return undefined;
+      if (read.done) return JSON.parse(await new Blob(chunks).text());
+      size += read.value.byteLength;
+      if (size > BODY_MAX_BYTES) return undefined;
+      chunks.push(read.value);
+    }
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+    reader.cancel().catch(() => {});
+  }
+}
+
+const strings = (value) =>
+  typeof value === "string" ? [value] : value && typeof value === "object" ? Object.values(value).flatMap(strings) : [];
+
+// A generic `error` gives way to the `details` beside it.
+function bodyMessage(body) {
+  if (!body || typeof body !== "object") return undefined;
+  const generic = body.error === "Internal server error" && "details" in body;
+  const fields = [generic ? undefined : body.error, body.message, body.detail, body.details, body.error?.message];
+  return fields.find((value) => typeof value === "string" && value.trim());
+}
+
+// A logged Error the body repeats, else the body's own message, else the last logged Error.
+function describe(body, errors) {
+  const texts = strings(body);
+  const repeated = errors.findLast(
+    ({ message }) => typeof message === "string" && message.trim() && texts.some((text) => text.includes(message)),
+  );
+  return repeated ?? bodyMessage(body) ?? errors.at(-1);
+}
+
+// TanStack answers a server function's error with the status the code set, else 200.
+export const recordFunctionError = (error, serverFnMeta) =>
+  safely(() => {
+    const status = getResponseStatus();
+    write(getRequest(), error, { status: status >= 400 ? status : 500, fn: serverFnMeta?.name ?? serverFnMeta?.id });
+  });
+
+// An escaped error answers with the status it carries, as TanStack's server reads it, else 500.
+export const recordRequestError = (request, error) =>
+  safely(() => {
+    const status = error?.status ?? error?.statusCode;
+    write(request, error, { status: Number.isInteger(status) && status >= 400 && status <= 599 ? status : 500 });
+  });
+
+// An errored route match renders its error component with a 500.
+export const recordRouteError = (request, error, route) => safely(() => write(request, error, { status: 500, route }));
+
+// A 5xx the app returned itself, such as a server route's caught error. The response goes out as it is; a copy of
+// it is read after that.
+export const recordErrorResponse = (request, result) =>
+  safely(() => {
+    const status = result?.response?.status;
+    if (!(status >= 500) || !request.headers.has(FEED_CONTEXT_HEADER) || recorded.has(request)) return;
+    const copy = result.response.clone();
+    waitUntil(
+      readJson(copy)
+        .then((body) => {
+          if (!recorded.has(request)) write(request, describe(body, loggedErrors.get(request) ?? []), { status });
+        })
+        .catch(() => {}),
+    );
+  });
+// Motore locale: costruisce un prompt cinematografico senza inviare nulla in rete.
+
+export const STYLES = {
+  cinematico: {
+    label: "Cinematografico",
+    en: {
+      look: "shot on an ARRI Alexa 65 with anamorphic Panavision lenses",
+      light: "motivated practical lighting, a soft key and a warm rim light",
+      grade: "a teal-and-orange grade with soft filmic contrast",
+      ref: "in the visual language of Roger Deakins and Denis Villeneuve",
+    },
+    it: {
+      look: "girato in ARRI Alexa 65 con lenti anamorfiche Panavision",
+      light: "luce pratica motivata, key morbida e controluce caldo",
+      grade: "color grading teal-and-orange con contrasto filmico morbido",
+      ref: "nel linguaggio visivo di Roger Deakins e Denis Villeneuve",
+    },
+  },
+  noir: {
+    label: "Noir in bianco e nero",
+    en: {
+      look: "high-contrast black-and-white 35mm photography with chiaroscuro lighting",
+      light: "hard sidelight cutting through venetian blinds, deep black shadows",
+      grade: "monochrome, crushed blacks and silver highlights",
+      ref: "in the style of classic 1940s film noir",
+    },
+    it: {
+      look: "fotografia 35mm in bianco e nero ad alto contrasto, luci chiaroscurali",
+      light: "luce laterale dura attraverso le tapparelle, ombre nere profonde",
+      grade: "monocromatico, neri schiacciati e alte luci argentate",
+      ref: "nello stile del film noir classico anni Quaranta",
+    },
+  },
+  scifi: {
+    label: "Sci-fi / Cyberpunk",
+    en: {
+      look: "neon-drenched cyberpunk cinematography with anamorphic lens flares",
+      light: "cyan and magenta practicals, wet reflections, volumetric fog",
+      grade: "cyan-magenta split tone with high saturation and deep blues",
+      ref: "in the world-building style of Blade Runner 2049",
+    },
+    it: {
+      look: "cinematografia cyberpunk intrisa di neon con flare anamorfici",
+      light: "luci pratiche ciano e magenta, riflessi bagnati, nebbia volumetrica",
+      grade: "split tone ciano-magenta, saturazione alta e blu profondi",
+      ref: "nella costruzione visiva di Blade Runner 2049",
+    },
+  },
+  horror: {
+    label: "Horror",
+    en: {
+      look: "desaturated 16mm photography with unsettling stillness",
+      light: "a single practical lamp, oppressive darkness and cold moonlight",
+      grade: "desaturated greens and browns with lifted blacks",
+      ref: "in the restrained dread of Ari Aster and Robert Eggers",
+    },
+    it: {
+      look: "fotografia 16mm desaturata, quiete inquietante",
+      light: "una sola lampada pratica, buio opprimente e chiaro di luna freddo",
+      grade: "verdi e marroni desaturati con neri alzati",
+      ref: "nel terrore trattenuto di Ari Aster e Robert Eggers",
+    },
+  },
+  documentario: {
+    label: "Documentario",
+    en: {
+      look: "handheld documentary realism on 16mm, available light only",
+      light: "natural available light, overcast sky, no stylization",
+      grade: "neutral, true-to-life color",
+      ref: "in the observational tradition of Frederick Wiseman",
+    },
+    it: {
+      look: "realismo documentaristico a mano in 16mm, solo luce disponibile",
+      light: "luce naturale disponibile, cielo coperto, nessuna stilizzazione",
+      grade: "colore neutro, fedele alla realtà",
+      ref: "nella tradizione osservativa di Frederick Wiseman",
+    },
+  },
+  anime: {
+    label: "Anime",
+    en: {
+      look: "hand-painted anime cel animation with luminous painted skies",
+      light: "golden-hour glow, soft bloom and painterly highlights",
+      grade: "saturated pastel palette with luminous blues",
+      ref: "in the style of Makoto Shinkai and Studio Ghibli",
+    },
+    it: {
+      look: "animazione anime cel dipinta a mano, cieli luminosi",
+      light: "bagliore dell'ora d'oro, bloom morbido, alte luci pittoriche",
+      grade: "palette pastello satura con blu luminosi",
+      ref: "nello stile di Makoto Shinkai e Studio Ghibli",
+    },
+  },
+  vintage: {
+    label: "Vintage Super 8",
+    en: {
+      look: "Super 8 and Kodak Portra 400 film, halation and light leaks",
+      light: "warm tungsten light, sun flare, imperfect exposure",
+      grade: "warm faded tones with a yellow cast and soft contrast",
+      ref: "like a 1970s Kodachrome home movie",
+    },
+    it: {
+      look: "pellicola Super 8 e Kodak Portra 400, aloni e infiltrazioni di luce",
+      light: "luce calda al tungsteno, flare solare, esposizione imperfetta",
+      grade: "toni caldi sbiaditi con dominante gialla e contrasto morbido",
+      ref: "come un filmino Kodachrome anni Settanta",
+    },
+  },
+  fantasy: {
+    label: "Fantasy epico",
+    en: {
+      look: "epic large-format fantasy cinematography",
+      light: "golden-hour backlight, god rays through mist",
+      grade: "rich earth tones with golden highlights",
+      ref: "in the epic scope of The Lord of the Rings",
+    },
+    it: {
+      look: "cinematografia fantasy epica in grande formato",
+      light: "controluce dell'ora d'oro, raggi di luce nella nebbia",
+      grade: "toni della terra ricchi con alte luci dorate",
+      ref: "nell'ampiezza epica de Il Signore degli Anelli",
+    },
+  },
+};
+
+export const STYLE_OPTIONS = Object.entries(STYLES).map(([value, s]) => ({ value, label: s.label }));
+
+export const RATIO_OPTIONS = [
+  { value: "16:9", label: "16:9 — Orizzontale" },
+  { value: "9:16", label: "9:16 — Verticale / Reels" },
+  { value: "2.39:1", label: "2.39:1 — CinemaScope" },
+  { value: "4:3", label: "4:3 — Vintage" },
+  { value: "1:1", label: "1:1 — Quadrato" },
+];
+
+export const MODELS = {
+  generico: { label: "Generico (nessuno)" },
+  sora: { label: "Sora (OpenAI)" },
+  runway: { label: "Runway Gen-3" },
+  kling: { label: "Kling" },
+  veo: { label: "Veo (Google)" },
+  pika: { label: "Pika" },
+  midjourney: { label: "Midjourney (immagine)" },
+  flux: { label: "Flux (immagine)" },
+};
+
+export const MODEL_OPTIONS = Object.entries(MODELS).map(([value, m]) => ({ value, label: m.label }));
+
+const IMAGE_MODELS = ["midjourney", "flux"];
+
+const SHOTS = {
+  en: [
+    "wide establishing shot",
+    "medium close-up",
+    "extreme close-up",
+    "low-angle hero shot",
+    "over-the-shoulder shot",
+    "slow dolly-in",
+    "descending crane shot",
+    "tracking shot from behind",
+  ],
+  it: [
+    "campo lunghissimo",
+    "primo piano medio",
+    "primissimo piano",
+    "inquadratura eroica dal basso",
+    "inquadratura sopra la spalla",
+    "carrello lento in avanti",
+    "gru che scende",
+    "carrello inseguimento da dietro",
+  ],
+};
+
+const LENSES = ["24mm", "35mm", "50mm", "85mm", "135mm"];
+
+const MOVES = {
+  en: ["a slow push-in", "a handheld follow", "a gentle orbit", "a locked-off tripod", "a subtle handheld drift"],
+  it: ["carrello lento in avanti", "seguito a mano", "orbita leggera", "camera fissa su cavalletto", "leggera deriva a mano"],
+};
+
+const AMBIENT = {
+  blueHour: { en: "at blue hour", it: "nell'ora blu" },
+  goldenHour: { en: "at golden hour", it: "nell'ora d'oro" },
+  midday: { en: "at harsh midday", it: "a mezzogiorno, con luce dura" },
+  rainNight: { en: "on a rain-soaked night", it: "in una notte bagnata dalla pioggia" },
+  mist: { en: "in pre-dawn mist", it: "nella nebbia prima dell'alba" },
+  overcast: { en: "on an overcast morning", it: "in una mattina di cielo coperto" },
+};
+
+const AMBIENT_BY_STYLE = {
+  cinematico: ["blueHour", "goldenHour", "mist"],
+  noir: ["rainNight", "blueHour"],
+  scifi: ["rainNight", "blueHour"],
+  horror: ["mist", "rainNight"],
+  documentario: ["overcast", "midday"],
+  anime: ["goldenHour", "blueHour"],
+  vintage: ["goldenHour", "midday"],
+  fantasy: ["goldenHour", "mist"],
+};
+
+const MOODS = {
+  en: ["quiet tension", "melancholic wonder", "restrained intimacy", "electric anticipation", "haunting calm"],
+  it: ["tensione silenziosa", "meraviglia malinconica", "intimità trattenuta", "attesa elettrica", "calma inquietante"],
+};
+
+const TEXTURES = {
+  en: ["fine 35mm grain", "clean digital capture with subtle halation", "16mm grain with soft edges", "crisp large-format detail"],
+  it: ["grana fine 35mm", "ripresa digitale pulita con leggero alone", "grana 16mm con bordi morbidi", "dettaglio grande formato nitido"],
+};
+
+const LABELS = {
+  en: {
+    header: "CINEMATIC PROMPT",
+    shot: "SHOT",
+    lens: "LENS",
+    movement: "MOVEMENT",
+    lighting: "LIGHTING",
+    color: "COLOR",
+    texture: "TEXTURE",
+    mood: "MOOD",
+    format: "FORMAT",
+    style: "STYLE",
+    negative: "NEGATIVE",
+    model: "MODEL",
+    negativeList:
+      "text, watermark, logo, distorted anatomy, extra limbs, flickering, morphing artifacts, low resolution",
+  },
+  it: {
+    header: "PROMPT CINEMATOGRAFICO",
+    shot: "INQUADRATURA",
+    lens: "OBIETTIVO",
+    movement: "MOVIMENTO",
+    lighting: "LUCE",
+    color: "COLORE",
+    texture: "TEXTURE",
+    mood: "ATMOSFERA",
+    format: "FORMATO",
+    style: "STILE",
+    negative: "NEGATIVO",
+    model: "MODELLO",
+    negativeList:
+      "testo, watermark, logo, anatomia distorta, arti in più, sfarfallio, artefatti di morphing, bassa risoluzione",
+  },
+};
+
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const capitalize = (text) => (text ? text.charAt(0).toUpperCase() + text.slice(1) : text);
+const stripFinalDot = (text) => text.trim().replace(/[.!?]+$/, "");
+
+export function buildPrompt({ idea, styleKey = "cinematico", ratio = "16:9", lang = "en", modelKey = "generico" }) {
+  const style = STYLES[styleKey] || STYLES.cinematico;
+  const s = style[lang] || style.en;
+  const L = LABELS[lang] || LABELS.en;
+  const model = MODELS[modelKey] || MODELS.generico;
+  const hasModel = Boolean(modelKey) && modelKey !== "generico";
+  const modelName = hasModel ? model.label : "";
+  const isImage = IMAGE_MODELS.indexOf(modelKey) !== -1;
+
+  const shot = pick(SHOTS[lang] || SHOTS.en);
+  const lens = pick(LENSES);
+  const move = pick(MOVES[lang] || MOVES.en);
+  const ambientKey = pick(AMBIENT_BY_STYLE[styleKey] || Object.keys(AMBIENT));
+  const ambient = AMBIENT[ambientKey][lang] || AMBIENT[ambientKey].en;
+  const mood = pick(MOODS[lang] || MOODS.en);
+  const texture = pick(TEXTURES[lang] || TEXTURES.en);
+
+  const subject = stripFinalDot(idea);
+  const opening =
+    lang === "en"
+      ? `${capitalize(subject)}. ${capitalize(shot)} on a ${lens} lens, ${move}.`
+      : `${capitalize(subject)}. ${capitalize(shot)} con obiettivo ${lens}, ${move}.`;
+
+  const prose =
+    lang === "en"
+      ? `${opening} ${capitalize(s.look)}. ${capitalize(s.light)}. ${capitalize(s.grade)}, ${texture}, ${ambient}. The mood is ${mood}. ${capitalize(s.ref)}.`
+      : `${opening} ${capitalize(s.look)}. ${capitalize(s.light)}. ${capitalize(s.grade)}, ${texture}, ${ambient}. L'atmosfera è ${mood}. ${capitalize(s.ref)}.`;
+
+  const lines = [
+    L.header,
+    "─".repeat(28),
+    prose,
+    "",
+    `${L.shot}: ${shot}`,
+    `${L.lens}: ${lens}${lang === "en" ? ", shallow depth of field" : ", profondità di campo ridotta"}`,
+    `${L.movement}: ${move}`,
+    `${L.lighting}: ${s.light}`,
+    `${L.color}: ${s.grade}`,
+    `${L.texture}: ${texture}`,
+    `${L.mood}: ${mood}`,
+    `${L.format}: ${ratio}${isImage ? "" : " · 10s · 24fps"}`,
+    ...(modelName ? [`${L.model}: ${modelName}`] : []),
+    `${L.style}: ${s.ref}`,
+    `${L.negative}: ${L.negativeList}`,
+  ];
+
+  return lines.join("\n");
+}
+
+export const styleLabel = (key) => (STYLES[key] ? STYLES[key].label : "Prompt");
+export const modelLabel = (key) => (MODELS[key] ? MODELS[key].label : "");
+import { QueryClient } from "@tanstack/react-query";
+
+// One client per router: on the server getRouter() runs per request, so a shared
+// client would render one visitor's cached query data into another visitor's page.
+export const createQueryClient = () =>
+  new QueryClient({
+    defaultOptions: {
+      queries: { staleTime: 30_000, refetchOnWindowFocus: false },
+    },
+  });
+import { useCallback, useEffect, useState } from "react";
+
+const STORAGE_KEY = "pac_history_v1";
+const MAX_ITEMS = 20;
+
+export function usePromptLibrary() {
+  const [items, setItems] = useState([]);
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(parsed)) setItems(parsed);
+    } catch {
+      /* storage non disponibile */
+    }
+  }, []);
+
+  const persist = (next) => {
+    setItems(next);
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      /* quota superata: la libreria resta in memoria */
+    }
+  };
+
+  const add = useCallback((entry) => {
+    setItems((prev) => {
+      const next = [entry, ...prev].slice(0, MAX_ITEMS);
+      try {
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        /* ignora */
+      }
+      return next;
+    });
+  }, []);
+
+  const clear = useCallback(() => persist([]), []);
+
+  return { items, add, clear };
+}
+
+export function formatHistoryDate(iso) {
+  try {
+    return new Date(iso).toLocaleString("it-IT", {
+      day: "2-digit",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return "";
+  }
+}
+import { clsx } from "clsx";
+import { twMerge } from "tailwind-merge";
+
+export function cn(...inputs) {
+  return twMerge(clsx(inputs));
+}
+import { HeadContent, Outlet, Scripts, createRootRoute } from "@tanstack/react-router";
+import { DefaultCatchBoundary } from "@/components/DefaultCatchBoundary";
+import { NotFound } from "@/components/NotFound";
+import { Toaster } from "@/components/ui/sonner";
+import { AuthProvider } from "@/lib/AuthContext";
+import { Base44Scripts } from "base44:document";
+import appCss from "@/index.css?url";
+
+export const Route = createRootRoute({
+  // Per-page <title>/meta come dalla head() di ogni route; questa è la base condivisa.
+  head: () => ({
+    meta: [
+      { charSet: "utf-8" },
+      { name: "viewport", content: "width=device-width, initial-scale=1" },
+      { title: "PromptAI Cinema — Generatore di Prompt IA Cinematografici" },
+      {
+        name: "description",
+        content:
+          "PromptAI Cinema trasforma le tue idee in prompt cinematografici pronti per i generatori video IA. Inquadratura, lenti, luce, color grading — gratis.",
+      },
+      { name: "theme-color", content: "#05070f" },
+    ],
+    links: [
+      { rel: "preconnect", href: "https://fonts.googleapis.com" },
+      { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
+      {
+        rel: "stylesheet",
+        href: "https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Sora:wght@300;400;500;600;700&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&display=swap",
+      },
+      { rel: "stylesheet", href: appCss },
+    ],
+  }),
+  errorComponent: DefaultCatchBoundary,
+  notFoundComponent: () => <NotFound />,
+  shellComponent: RootDocument,
+  component: RootComponent,
+});
+
+function RootComponent() {
+  return (
+    <AuthProvider>
+      <Outlet />
+      <Toaster />
+    </AuthProvider>
+  );
+}
+
+// Il documento. Non esiste index.html: il server renderizza <html> da qui.
+function RootDocument({ children }) {
+  return (
+    <html lang="it">
+      <head>
+        <HeadContent />
+      </head>
+      <body data-react-root="true">
+        {children}
+        <Base44Scripts />
+        <Scripts />
+      </body>
+    </html>
+  );
+}
+import { createFileRoute } from "@tanstack/react-router";
+import SiteHeader from "@/components/site/SiteHeader";
+import PromptStudio from "@/components/site/PromptStudio";
+import Features from "@/components/site/Features";
+import Pricing from "@/components/site/Pricing";
+import ModelShowcase from "@/components/site/ModelShowcase";
+import CtaSection from "@/components/site/CtaSection";
+import SiteFooter from "@/components/site/SiteFooter";
+
+export const Route = createFileRoute("/")({
+  head: () => ({
+    meta: [
+      { title: "PromptAI Cinema — Generatore di Prompt IA Cinematografici" },
+      {
+        name: "description",
+        content:
+          "Trasforma una frase in un prompt cinematografico professionale: inquadratura, lenti, luce e color grading pronti per Sora, Runway, Kling, Veo e Midjourney.",
+      },
+    ],
+  }),
+  component: HomePage,
+});
+
+function HomePage() {
+  return (
+    <div id="top" className="min-h-screen">
+      <SiteHeader />
+      <main>
+        <PromptStudio />
+        <Features />
+        <Pricing />
+        <ModelShowcase />
+        <CtaSection />
+      </main>
+      <SiteFooter />
+    </div>
+  );
+}
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 224 55% 4%;
+    --foreground: 210 40% 97%;
+
+    --card: 223 44% 7%;
+    --card-foreground: 210 40% 97%;
+
+    --popover: 223 44% 7%;
+    --popover-foreground: 210 40% 97%;
+
+    --primary: 189 100% 50%;
+    --primary-foreground: 224 55% 6%;
+
+    --secondary: 222 30% 13%;
+    --secondary-foreground: 210 40% 97%;
+
+    --muted: 222 28% 12%;
+    --muted-foreground: 215 22% 66%;
+
+    --accent: 322 100% 71%;
+    --accent-foreground: 224 55% 6%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 220 26% 17%;
+    --input: 220 26% 17%;
+    --ring: 189 100% 50%;
+
+    --chart-1: 189 100% 50%;
+    --chart-2: 322 100% 71%;
+    --chart-3: 262 83% 68%;
+    --chart-4: 43 74% 66%;
+    --chart-5: 160 84% 45%;
+
+    --radius: 0.9rem;
+
+    --font-heading: "Sora", ui-sans-serif, system-ui, sans-serif;
+    --font-body: "Inter", ui-sans-serif, system-ui, sans-serif;
+    --font-display: "Instrument Serif", ui-serif, Georgia, serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+    --sidebar-background: 224 50% 5%;
+    --sidebar-foreground: 210 40% 96%;
+    --sidebar-primary: 189 100% 50%;
+    --sidebar-primary-foreground: 224 55% 6%;
+    --sidebar-accent: 222 30% 13%;
+    --sidebar-accent-foreground: 210 40% 96%;
+    --sidebar-border: 220 26% 17%;
+    --sidebar-ring: 189 100% 50%;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    scroll-padding-top: 96px;
+  }
+
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground font-body antialiased;
+    background-image:
+      radial-gradient(60% 45% at 50% -8%, rgba(0, 212, 255, 0.14), transparent 72%),
+      radial-gradient(45% 40% at 88% 4%, rgba(255, 107, 203, 0.1), transparent 70%);
+    background-repeat: no-repeat;
+  }
+
+  ::selection {
+    background: rgba(0, 212, 255, 0.28);
+    color: #ffffff;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    @apply font-heading tracking-tight;
+    text-wrap: balance;
+  }
+}
+
+@layer utilities {
+  .text-gradient {
+    background-image: linear-gradient(100deg, #66e7ff 0%, #00d4ff 38%, #ff6bcb 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .panel {
+    background:
+      linear-gradient(180deg, rgba(16, 24, 43, 0.92) 0%, rgba(8, 13, 25, 0.94) 100%);
+    border: 1px solid rgba(120, 160, 200, 0.13);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.05),
+      0 30px 80px -40px rgba(0, 0, 0, 0.9);
+  }
+
+  .panel-soft {
+    background: linear-gradient(180deg, rgba(16, 24, 43, 0.62) 0%, rgba(8, 13, 25, 0.7) 100%);
+    border: 1px solid rgba(120, 160, 200, 0.1);
+  }
+
+  .glow-cyan {
+    box-shadow: 0 0 0 1px rgba(0, 212, 255, 0.18), 0 26px 70px -30px rgba(0, 212, 255, 0.45);
+  }
+
+  .hairline {
+    background-image: linear-gradient(90deg, transparent, rgba(140, 180, 220, 0.22), transparent);
+  }
+
+  .grid-lines {
+    background-image:
+      repeating-linear-gradient(90deg, rgba(0, 212, 255, 0.055) 0px, rgba(0, 212, 255, 0.055) 1px, transparent 1px, transparent 72px),
+      repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.02) 0px, rgba(255, 255, 255, 0.02) 1px, transparent 1px, transparent 72px);
+    mask-image: radial-gradient(70% 60% at 50% 20%, #000 20%, transparent 85%);
+    -webkit-mask-image: radial-gradient(70% 60% at 50% 20%, #000 20%, transparent 85%);
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .prose-prompt {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.85;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+}
+import { createRouter } from "@tanstack/react-router";
+import { setupRouterSsrQueryIntegration } from "@tanstack/react-router-ssr-query";
+import { routeTree } from "./routeTree.gen";
+import { DefaultCatchBoundary } from "@/components/DefaultCatchBoundary";
+import { NotFound } from "@/components/NotFound";
+import { createQueryClient } from "@/lib/query-client";
+
+export function getRouter() {
+  const queryClient = createQueryClient();
+  const router = createRouter({
+    routeTree,
+    context: { queryClient },
+    defaultPreload: "intent",
+    defaultPreloadStaleTime: 0,
+    defaultErrorComponent: DefaultCatchBoundary,
+    defaultNotFoundComponent: () => <NotFound />,
+    scrollRestoration: true,
+  });
+  // Provides QueryClientProvider and ships queries fetched during SSR to the browser cache.
+  setupRouterSsrQueryIntegration({ router, queryClient });
+  return router;
+}
+// Base44 managed file: error-capture v1. Keep it as it is, and keep it as `main` in wrangler.jsonc; Base44
+// replaces it with newer versions. The Worker's entry: TanStack Start's default one, which also reports a
+// page's loader and beforeLoad errors to Base44. What a visitor gets back is unchanged.
+import { createStartHandler, defaultStreamHandler } from "@tanstack/react-start/server";
+import { recordRouteError } from "@/lib/error-capture.server";
+
+// Runs once the router has loaded the page.
+const handler = createStartHandler((ctx) => {
+  for (const match of ctx.router.state.matches) {
+    if (match.status === "error") recordRouteError(ctx.request, match.error, match.routeId);
+  }
+  return defaultStreamHandler(ctx);
+});
+
+export default { fetch: handler };
+import { createStart } from "@tanstack/react-start";
+import { authMiddleware, base44RequestMiddleware } from "@/lib/auth-middleware";
+import { errorCaptureFunctionMiddleware, errorCaptureRequestMiddleware } from "@/lib/error-capture";
+
+// Every server function and server route gets `context.getBase44()`, acting as the visitor.
+// Error capture goes first, so it sees what the other middlewares and the handlers throw.
+export const startInstance = createStart(() => ({
+  requestMiddleware: [errorCaptureRequestMiddleware, base44RequestMiddleware],
+  functionMiddleware: [errorCaptureFunctionMiddleware, authMiddleware],
+}));
+# env
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+
+node_modules
+*.local
+
+# build output. The Cloudflare Vite plugin emits dist/{client,server} plus the
+# .wrangler/deploy redirect the Base44 publish reads; every build regenerates
+# all of them.
+dist
+.wrangler
+.tanstack
+.dev.vars*
+
+# generated by the TanStack Router plugin on every dev/build run — never edit
+src/routeTree.gen.ts
+
+# editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.sw?
+
+# Local link to a Base44 app, written by `base44 link`
+base44/.app.jsonc
+# AGENTS.md
+
+## Project Context
+
+This is a Base44 app repository built with **TanStack Start** (React 19, plain JavaScript — no TypeScript): file-based routes, server functions and server routes, server-side rendering by default. Treat it as user-owned application code, keep changes focused on the user's request, and preserve the conventions below.
+
+Start with `README.md` for local setup and the publish workflow.
+
+## Base44 References
+
+- CLI overview: https://docs.base44.com/developers/references/cli/get-started/overview.md
+- Agent skills: https://docs.base44.com/developers/backend/overview/skills.md
+
+If your agent supports Agent Skills, install or update Base44 skills before Base44-specific work:
+
+```bash
+npx skills add base44/skills
+```
+
+## Key Files
+
+- `src/routes/__root.jsx`: the HTML document (`<html>`, `<head>` via `HeadContent`, `<Scripts />`) and the providers. There is **no `index.html`**.
+- `src/routes/*.jsx`: one page per file (`index.jsx` → `/`, `posts.$id.jsx` → `/posts/$id`). `src/routes/api/*.js`: server routes (raw HTTP endpoints). `src/routeTree.gen.ts` is generated on every dev/build run — never edit or commit it (it is the one TypeScript file, owned by the router plugin).
+- `src/lib/server-fns.js`: where server functions (`createServerFn`), the data layer pages call, go. The starter has none yet: create the file with the first one.
+- `src/start.js`: the Start instance; it applies `src/lib/auth-middleware.js` — `authMiddleware` to every server function and `base44RequestMiddleware` to every request — so each server function and server route handler gets `context.getBase44()` (returns a server-side SDK client acting as the visitor, created on first call) without opting in. Only call it when the handler needs Base44 — it requires the platform headers, and a handler that never calls it must still answer without them.
+- `src/server.js`, `src/lib/error-capture.js` and `src/lib/error-capture.server.js`: Base44 managed files that report the app's server errors to Base44, so its owner sees them as alerts. Each carries a version marker and Base44 replaces it with newer versions: never edit, move or delete them, keep `src/server.js` as `main` in `wrangler.jsonc`, and keep the two error-capture middlewares first in `src/start.js`. They change nothing a visitor gets back.
+- `src/lib/auth-middleware.js`: the server-side SDK client, built from the platform headers with `createClientFromRequest` and handed to every server function and server route as `context.getBase44()`. `src/api/base44Client.js`: the browser SDK client, same as the Base44 SPA template — leave it at that path, the builder tooling probes it.
+- `src/lib/AuthContext.jsx`: client-side session (`useAuth()`: `user`, `isAuthenticated`, `isLoadingAuth`, `authError`, `refresh`, `logout`, `navigateToLogin`), resolved after hydration as `authQuery` in the router's QueryClient (one `/me` call per page load when an access token is present, none for anonymous visitors; shared with the login gate, which reads it from the router context).
+- `src/components/auth/`: auth boilerplate — the auth pages and a login gate. Nothing imports it until you wire it in; see **Adding Authentication**.
+- `__root.jsx` renders `<Base44Scripts />` (from `base44:document`, a virtual module the Base44 Vite plugin serves) in `<body>` right before `<Scripts />`: the builder and analytics hooks an `index.html` app gets injected. Keep it there — never in `head()`, and not after `<Scripts />` (module scripts run in document order, so the error handlers must come before the app entry). Keep `data-react-root` on `<body>` too; the builder's preview bridge reads it.
+- App chrome: the starter has none. A shared header or nav is a component the app writes, rendered around `<Outlet />` by a layout route, so the auth pages stay outside it: `__root.jsx` while the app has no auth routes; `_authed.jsx` once it has them, with gated pages under `_authed/`; and if it also keeps public pages, a pathless `_site.jsx` rendering the same component, with those pages under `_site/`. The home page (`/`) is one file — `index.jsx`, `_authed/index.jsx` or `_site/index.jsx`: move it there, never copy it.
+- `src/components/ui/`: shadcn/ui kit (JSX, shared with the Base44 SPA template). `src/index.css` + `tailwind.config.js`: design tokens.
+- `vite.config.js`: `base44()` (sandbox/platform wiring), `cloudflare({ viteEnvironment: { name: "ssr" } })`, `tanstackStart()`, `react()`. The Cloudflare plugin runs the server in `workerd` and emits the build Base44's publish reads. Do not remove or reorder any of them. Keep `PREBUNDLE`: Vite bundles every runtime dependency in `package.json` at startup, for the browser and the server, so a package first imported mid-session can't make the server render load a second React. A new dependency joins it automatically.
+- `wrangler.jsonc`: the Worker's entry (`src/server.js`), compatibility date and `nodejs_compat`. Keep `main` and `nodejs_compat`. Bindings and `vars` in it are not deployed: secrets come from the Base44 dashboard / `base44 secrets set`.
+
+## Adding Authentication
+
+The starter ships no sign-in UI and no auth routes. `AuthProvider` resolves the visitor and `useAuth()` exposes it; everything else is boilerplate in `src/components/auth/` that renders nothing until a route or the header uses it. Wire in only what the app needs, and keep the components' flows, SDK calls and `returnTo` handling when you restyle them.
+
+- **Sign-in entry point**: a Sign in button calls `useAuth().navigateToLogin()`, which sends the visitor to `/login` and back to the current page; Sign out calls `useAuth().logout()`. On an app with its own auth pages `/login` is the app's route below; otherwise the platform serves it.
+- **Gated pages**: create the login gate once, then put every page that requires a session under `src/routes/_authed/` (`_authed/dashboard.jsx` → `/dashboard`). The gate resolves the session before any child loader runs, sends a signed-out visitor to `/login?returnTo=…` and shows the not-registered screen to a Base44 user who is not a user of this app; children read the visitor with `Route.useRouteContext().user`. Never re-implement the gate in a page.
+
+```jsx
+// src/routes/_authed.jsx
+import { createFileRoute } from "@tanstack/react-router";
+import { AuthGateError, requireSignedIn } from "@/components/auth/AuthGate";
+
+export const Route = createFileRoute("/_authed")({ ssr: false, beforeLoad: requireSignedIn, errorComponent: AuthGateError });
+```
+
+- **The app's own auth pages** (an app with custom auth, which serves `/login` itself instead of the platform): create all five routes together, even when only one was asked for — each page links to the others, the reset email targets `/reset-password` and a Google or SSO sign-in that needs MFA comes back to `/mfa`. Each route file only wires a page component from `src/components/auth/`:
+
+| Route file | Path | Component |
+| --- | --- | --- |
+| `src/routes/login.jsx` | `/login` | `LoginPage` |
+| `src/routes/register.jsx` | `/register` | `RegisterPage` (register → email code → `verifyOtp` → `setToken`; never sign in right after `register`, the account is unverified) |
+| `src/routes/forgot-password.jsx` | `/forgot-password` | `ForgotPasswordPage` |
+| `src/routes/reset-password.jsx` | `/reset-password` | `ResetPasswordPage` (reads `?token=`) |
+| `src/routes/mfa.jsx` | `/mfa` | `MfaPage` (finishes a sign-in that needs MFA; opened directly, the two-factor authentication settings) |
+
+```jsx
+// src/routes/login.jsx — the other three follow the same shape
+import { createFileRoute } from "@tanstack/react-router";
+import { LoginPage } from "@/components/auth/LoginPage";
+
+export const Route = createFileRoute("/login")({ ssr: false, head: () => ({ meta: [{ title: "Sign in" }] }), component: LoginPage });
+```
+
+  These pages render full-screen: keep them outside any layout route that renders app chrome (header, nav). Every page honors a same-origin `returnTo` (and the platform's `from_url`) via `safeReturnTo()` from `src/lib/authReturnTo.js` — keep that, never hardcode `/`. Sign-in goes through `loginWithMfa` (`src/lib/authMfa.js`) and `signInWithProvider` (`src/lib/authMfaFlow.js`). When the app requires MFA, `LoginPage` and `RegisterPage` return `<MfaScreen><MfaFlow … /></MfaScreen>` in place of the whole page (`MfaFlow` and `MfaManage` are card content: never nest them in another card), and `MfaManage` on `/mfa` enables, replaces and disables methods. Link to `/mfa` and add a forget-remembered-devices control (`session.forgetDevices`) only when asked; the link usually belongs on the profile or account page. Restyle or translate those screens, but keep every step and their `session-record-block` wrapper, which keeps codes out of session recordings; never edit the two helpers, call the MFA API directly or build other MFA screens.
+- **MCP consent**: an app with an MCP server needs `src/routes/oauth/consent.jsx` (`/oauth/consent`) rendering `ConsentPage`, with `ssr: false`. It handles the signed-out case itself, so keep it outside `_authed/`.
+
+## Server Security
+
+- Every server function and every server route is a public HTTP endpoint: anyone can call it directly, with any input, without going through your pages. A page's `beforeLoad`, redirect or hidden button protects nothing on the server.
+- `authMiddleware` only forwards the visitor's token; it does not reject anyone. A server function that needs a signed-in caller adds `.middleware([requireUser])` (from `src/lib/auth-middleware.js`) and reads `context.user`. Then check that this user may touch the records it asks for (owner, membership or role) before reading or changing them.
+- Validate input with `.validator(...)` (zod is installed) — never trust ids, emails or roles sent by the caller.
+- `context.getBase44().asServiceRole` bypasses every entity access rule. Use it only after `requireUser` plus an ownership/role check, or in a webhook that verifies its signature — never in a handler an anonymous caller reaches, and never to "fix" a page that renders empty for anonymous visitors.
+- Bound every input of a credit-spending function: `.max()` on strings and arrays, `z.enum` for choices.
+- The app's own code calls the server only through server functions, never by fetching one of its own routes. A server route (`src/routes/api/*`) is for a URL something else requests: a webhook or callback another service calls, a link or image the browser loads by itself (`<a href>`, `<img src>`), a feed or a public API. Those requests carry no visitor token, so such a route is public, verifies a webhook signature, or checks a short-lived signed token a server function issued. A route whose callers do send a Base44 token adds `server: { middleware: [requireUserRoute], handlers }` (from `src/lib/auth-middleware.js`): it answers anonymous callers with 401 and sets `context.user`. Put it only on `src/routes/api/*` files — a route's middleware also runs for every route under it.
+- Never forward, log or return incoming request headers: the platform's request headers carry a service credential for this app.
+- Secrets: set them with `base44 secrets set` and read them in server code only, with `import { secrets } from "base44:runtime"` → `secrets.get("NAME")` (never `process.env`). Anything under `import.meta.env.VITE_*` is compiled into the browser bundle — never put a secret there.
+- A route that opts into shared caching (`Cache-Control: public` / `s-maxage` in `headers()`) must render the same HTML for everyone: no per-user data and no `asServiceRole` reads in its loader.
+
+## AI Features
+
+- TanStack AI is installed (`@tanstack/ai`, `@tanstack/ai-openai`, `@tanstack/ai-react`) and runs on the Base44 AI gateway: no API key, usage billed to the app's AI credits. In server code only, build the adapter with `gatewayModel(context.getBase44())` from `src/lib/ai.server.js`. It calls the gateway as the app (service role), since an owner can restrict the gateway to server-side calls, so authenticate the caller before calling it. Tools keep using `context.getBase44()` and act as the caller. Keep model `"automatic"` unless the task needs a specific one; named models cost more credits.
+- Every AI call spends the app owner's credits, so an AI endpoint follows the Server Security rules above: sign-in required, input validated, and the loop bounded with `agentLoopStrategy: maxIterations(n)`.
+- A chat UI streams from a server function: its handler returns the `chat(...)` stream, and `useChat` reads it through `fetcher`. Tools are ordinary server code and run as the signed-in caller:
+
+```js
+// src/lib/chat.js
+import { chat, maxIterations, toolDefinition } from "@tanstack/ai";
+import { createServerFn } from "@tanstack/react-start";
+import { z } from "zod";
+import { gatewayModel } from "@/lib/ai.server";
+import { requireUser } from "@/lib/auth-middleware";
+
+export const chatWithAssistant = createServerFn({ method: "POST" })
+  .middleware([requireUser])
+  .validator(z.object({ messages: z.array(z.any()).max(40) }))
+  .handler(({ data, context }) => {
+    const base44 = context.getBase44();
+    const listOrders = toolDefinition({
+      name: "listOrders",
+      description: "The caller's recent orders, optionally filtered by status",
+      inputSchema: z.object({ status: z.string().optional() }),
+    }).server(({ status }) => base44.entities.Order.filter(status ? { status } : {}, "-created_date", 20));
+
+    return chat({
+      adapter: gatewayModel(base44),
+      messages: data.messages,
+      systemPrompts: ["You help customers with their orders."],
+      tools: [listOrders],
+      agentLoopStrategy: maxIterations(5),
+    });
+  });
+```
+
+- In the page, `useChat` streams the reply. Messages are `{ id, role, parts }`; render `part.content` for `part.type === "text"`. Give the page `ssr: false`, as for any per-user page.
+
+```jsx
+import { useChat } from "@tanstack/ai-react";
+import { chatWithAssistant } from "@/lib/chat";
+
+const { messages, sendMessage, isLoading } = useChat({
+  // send only the recent history: the server caps it, and a long chat would otherwise fail every turn
+  fetcher: ({ messages }, { signal }) => chatWithAssistant({ data: { messages: messages.slice(-40) }, signal }),
+});
+```
+
+- For AI work without a chat (summaries, classification, background agents), call `chat({ adapter, messages, stream: false })` inside a server function and return its result, or pass `outputSchema` (a zod schema) for typed JSON.
+
+## Working Notes
+
+- `npm run dev` runs the TanStack dev server (Vite); server code runs in `workerd`, exactly as in production.
+- `npm run build` emits `dist/client` (static assets), `dist/server` (the Worker) and `.wrangler/deploy/config.json` (what publish reads). Never commit any of them.
+- Read secrets inside a handler with `secrets.get("NAME")` from `base44:runtime`. Never from client code.
+- Data flows through the router: `loader` + `Route.useLoaderData()` for reads, `useServerFn` + TanStack Query mutations for writes. Every server function and server route already runs as the caller through `context.getBase44()`. The router creates the `QueryClient` per request (`src/router.jsx`); never share one across requests with a module-level client. To read through TanStack Query instead, prefetch in the loader with `context.queryClient.ensureQueryData(options)` and read the same options with `useSuspenseQuery` in the component: `setupRouterSsrQueryIntegration` sends the server-fetched cache to the browser, so it is not fetched twice. That cache is embedded in the HTML, so the shared-cache rule above applies to it.
+- `ssr: false` only on pages that need the signed-in user, so personal data never lands in cacheable HTML, and on the auth pages and `oauth/consent` as wired above; every other page (home, listings, details, tools, pages with only browser state) stays SSR'd and may opt into edge caching via the route's `headers()` (`Cache-Control: public, s-maxage=…`).
+- Server and first client render must match: read `window`, `document` and browser storage only in effects and handlers (never in render or a `useState` initializer), and format dates and numbers with an explicit locale and time zone.
+- `/api/apps/**`, `/api/app-logs/**` and `/ws-user-apps/**` belong to the Base44 platform API — never define routes under them.
+- When working locally, prefer the Base44 CLI (`base44 dev`, `base44 deploy`, `base44 secrets set`) over adding npm scripts for Base44 tasks.
+- Run `npm run lint` before finishing code changes. Write JavaScript/JSX only — no `.ts`/`.tsx` files and no type annotations (the generated `src/routeTree.gen.ts` is the sole exception and is never hand-edited).
+# See AGENTS.md
+
+Follow the instructions in `AGENTS.md`.
+{
+  "$schema": "https://ui.shadcn.com/schema.json",
+  "style": "new-york",
+  "rsc": false,
+  "tsx": false,
+  "tailwind": {
+    "config": "tailwind.config.js",
+    "css": "src/index.css",
+    "baseColor": "neutral",
+    "cssVariables": true,
+    "prefix": ""
+  },
+  "aliases": {
+    "components": "@/components",
+    "utils": "@/lib/utils",
+    "ui": "@/components/ui",
+    "lib": "@/lib",
+    "hooks": "@/hooks"
+  },
+  "iconLibrary": "lucide"
+}
+import pluginJs from "@eslint/js";
+import pluginReactHooks from "eslint-plugin-react-hooks";
+import globals from "globals";
+
+export default [
+  {
+    ignores: ["node_modules", "dist", ".wrangler", ".tanstack", "src/routeTree.gen.ts", "src/components/ui/**"],
+  },
+  pluginJs.configs.recommended,
+  {
+    files: ["**/*.{js,jsx}"],
+    languageOptions: {
+      globals: { ...globals.browser, ...globals.node },
+      parserOptions: { ecmaVersion: "latest", sourceType: "module", ecmaFeatures: { jsx: true } },
+    },
+    plugins: { "react-hooks": pluginReactHooks },
+    rules: {
+      "react-hooks/rules-of-hooks": "error",
+      "no-unused-vars": ["warn", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }],
+    },
+  },
+];
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": { "@/*": ["./src/*"] },
+    "jsx": "react-jsx",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "esnext"
+  },
+  "exclude": ["node_modules", "dist", ".wrangler", ".tanstack"]
+}
+{
+  "name": "base44-tanstack-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "lint": "eslint . --quiet",
+    "lint:fix": "eslint . --fix",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@base44/sdk": "^0.8.54",
+    "@base44/vite-plugin": "1.0.52",
+    "@hello-pangea/dnd": "^18.0.1",
+    "@hookform/resolvers": "^5.9.1",
+    "@radix-ui/react-accordion": "^1.2.3",
+    "@radix-ui/react-alert-dialog": "^1.1.6",
+    "@radix-ui/react-aspect-ratio": "^1.1.2",
+    "@radix-ui/react-avatar": "^1.1.3",
+    "@radix-ui/react-checkbox": "^1.1.4",
+    "@radix-ui/react-collapsible": "^1.1.3",
+    "@radix-ui/react-context-menu": "^2.2.6",
+    "@radix-ui/react-dialog": "^1.1.6",
+    "@radix-ui/react-dropdown-menu": "^2.1.6",
+    "@radix-ui/react-hover-card": "^1.1.6",
+    "@radix-ui/react-label": "^2.1.2",
+    "@radix-ui/react-menubar": "^1.1.6",
+    "@radix-ui/react-navigation-menu": "^1.2.5",
+    "@radix-ui/react-popover": "^1.1.6",
+    "@radix-ui/react-progress": "^1.1.2",
+    "@radix-ui/react-radio-group": "^1.2.3",
+    "@radix-ui/react-scroll-area": "^1.2.3",
+    "@radix-ui/react-select": "^2.1.6",
+    "@radix-ui/react-separator": "^1.1.2",
+    "@radix-ui/react-slider": "^1.2.3",
+    "@radix-ui/react-slot": "^1.1.2",
+    "@radix-ui/react-switch": "^1.1.3",
+    "@radix-ui/react-tabs": "^1.1.3",
+    "@radix-ui/react-toast": "^1.2.2",
+    "@radix-ui/react-toggle": "^1.1.2",
+    "@radix-ui/react-toggle-group": "^1.1.2",
+    "@radix-ui/react-tooltip": "^1.1.8",
+    "@stripe/react-stripe-js": "^3.10.0",
+    "@stripe/stripe-js": "^5.2.0",
+    "@tanstack/ai": "^0.54.0",
+    "@tanstack/ai-openai": "^0.22.6",
+    "@tanstack/ai-react": "^0.24.1",
+    "@tanstack/react-query": "^5.84.1",
+    "@tanstack/react-router": "^1.170.0",
+    "@tanstack/react-router-ssr-query": "1.167.3",
+    "@tanstack/react-start": "^1.168.60",
+    "canvas-confetti": "^1.9.4",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.0.0",
+    "date-fns": "^3.6.0",
+    "embla-carousel-react": "^8.5.2",
+    "framer-motion": "^11.16.4",
+    "html2canvas": "^1.4.1",
+    "input-otp": "^1.4.2",
+    "jspdf": "^4.2.1",
+    "lodash": "^4.17.21",
+    "lucide-react": "^0.475.0",
+    "moment": "^2.31.0",
+    "next-themes": "^0.4.4",
+    "react": "^19.1.0",
+    "react-day-picker": "^8.10.1",
+    "react-dom": "^19.1.0",
+    "react-hook-form": "^7.54.2",
+    "react-hot-toast": "^2.6.0",
+    "react-leaflet": "^5.0.0",
+    "react-markdown": "^9.0.1",
+    "react-quill-new": "^3.8.3",
+    "react-resizable-panels": "^2.1.7",
+    "recharts": "^2.15.4",
+    "sonner": "^2.0.1",
+    "tailwind-merge": "^3.0.2",
+    "tailwindcss-animate": "^1.0.7",
+    "three": "^0.171.0",
+    "vaul": "^1.1.2",
+    "zod": "~4.6.7"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.54.6",
+    "@eslint/js": "^9.19.0",
+    "@vitejs/plugin-react": "^6.0.5",
+    "autoprefixer": "^10.4.20",
+    "eslint": "^9.19.0",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "globals": "^15.14.0",
+    "postcss": "^8.5.3",
+    "tailwindcss": "^3.4.17",
+    "vite": "^8.2.4",
+    "wrangler": "^4.130.0"
+  },
+  "overrides": {
+    "undici": "7.30.1"
+  }
+}
+export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+}
+# Base44 App — TanStack Start
+
+A full-stack Base44 app: [TanStack Start](https://tanstack.com/start) (React 19, plain JavaScript) with file-based routes, server functions and server routes, server-rendered and hosted by Base44.
+
+## What is in the starter
+
+| Route | File |
+| --- | --- |
+| `/` | `src/routes/index.jsx` — a placeholder home page, replaced by the app's own |
+
+## Run locally
+
+```bash
+npm ci
+base44 login   # one-time per machine
+base44 link    # one-time per clone
+base44 dev     # local backend + app together
+```
+
+## Build and publish
+
+```bash
+npm run build         # -> dist/client (assets) + dist/server (the Worker)
+base44 deploy         # or publish from the Base44 builder
+```
+
+There is no `index.html`: the HTML document is rendered on the server from `src/routes/__root.jsx`. The build runs through the [Cloudflare Vite plugin](https://developers.cloudflare.com/workers/vite-plugin/), so dev and build both execute server code in `workerd`.
+
+## How the pieces fit
+
+- **Pages** are files in `src/routes/`. A route's `loader` runs on the server for a document request and in the browser for a client navigation; `Route.useLoaderData()` gives the component the resolved data.
+- **Server functions** (in `src/lib/server-fns.js`, created with the first one) are RPCs created with `createServerFn`. `src/start.js` runs every one of them through `authMiddleware`, which sends the visitor's token along, so `context.getBase44()` returns a client acting as that visitor and entity access rules apply. `context.getBase44().asServiceRole` bypasses them, so use it only after authenticating the caller (`.middleware([requireUser])`) and checking they may access the records involved: server functions and server routes are public endpoints anyone can call with any input. See **Server Security** in `AGENTS.md`. Call it only in handlers that need Base44: it reads the platform headers, and a handler that never calls it works without them.
+- **Secrets** are read in server code with `import { secrets } from "base44:runtime"` → `secrets.get("NAME")`, inside a handler. Never `process.env`.
+- **Server routes** (`src/routes/api/*.js`) are raw HTTP endpoints for URLs something other than the app's own code requests (webhooks, downloads, feeds); the app's pages call server functions. `src/start.js` runs every request through `base44RequestMiddleware`, so their `server.handlers` receive the same `context.getBase44()` (`({ request, params, context }) => …`).
+- **Server-only code** lives in `*.server.js` files (TanStack refuses to bundle them for the browser).
+- **Auth** is resolved client-side after hydration (`useAuth()`); the server is anonymous on a document request, so give per-user pages `ssr: false`.
+- **Sign-in and gated pages** are not wired in the starter: `src/components/auth/` holds the pages (login, register, password reset, MCP consent) and a login gate for `src/routes/_authed/`, to add when the app needs them. See **Adding Authentication** in `AGENTS.md`.
+- **AI**: TanStack AI is installed and runs on the Base44 AI gateway, with no API key and usage billed to the app's AI credits. `gatewayModel(context.getBase44())` in `src/lib/ai.server.js` builds the adapter; `AGENTS.md` has a streaming chat example (a server function plus `useChat`).
+- **Caching**: the platform caches only what a route opts into via `headers()` (`Cache-Control: public, s-maxage=…`). Everything else is served fresh.
+import animate from "tailwindcss-animate";
+
+/** @type {import('tailwindcss').Config} */
+export default {
+    darkMode: ["class"],
+    content: ["./index.html", "./src/**/*.{ts,tsx,js,jsx}"],
+  theme: {
+  	extend: {
+  		opacity: Object.fromEntries(Array.from({ length: 101 }, (_, i) => [i, `${i / 100}`])),
+  		borderRadius: {
+  			lg: 'var(--radius)',
+  			md: 'calc(var(--radius) - 2px)',
+  			sm: 'calc(var(--radius) - 4px)'
+  		},
+  		colors: {
+  			background: 'hsl(var(--background))',
+  			foreground: 'hsl(var(--foreground))',
+  			card: {
+  				DEFAULT: 'hsl(var(--card))',
+  				foreground: 'hsl(var(--card-foreground))'
+  			},
+  			popover: {
+  				DEFAULT: 'hsl(var(--popover))',
+  				foreground: 'hsl(var(--popover-foreground))'
+  			},
+  			primary: {
+  				DEFAULT: 'hsl(var(--primary))',
+  				foreground: 'hsl(var(--primary-foreground))'
+  			},
+  			secondary: {
+  				DEFAULT: 'hsl(var(--secondary))',
+  				foreground: 'hsl(var(--secondary-foreground))'
+  			},
+  			muted: {
+  				DEFAULT: 'hsl(var(--muted))',
+  				foreground: 'hsl(var(--muted-foreground))'
+  			},
+  			accent: {
+  				DEFAULT: 'hsl(var(--accent))',
+  				foreground: 'hsl(var(--accent-foreground))'
+  			},
+  			destructive: {
+  				DEFAULT: 'hsl(var(--destructive))',
+  				foreground: 'hsl(var(--destructive-foreground))'
+  			},
+  			border: 'hsl(var(--border))',
+  			input: 'hsl(var(--input))',
+  			ring: 'hsl(var(--ring))',
+  			chart: {
+  				'1': 'hsl(var(--chart-1))',
+  				'2': 'hsl(var(--chart-2))',
+  				'3': 'hsl(var(--chart-3))',
+  				'4': 'hsl(var(--chart-4))',
+  				'5': 'hsl(var(--chart-5))'
+  			},
+  			sidebar: {
+  				DEFAULT: 'hsl(var(--sidebar-background))',
+  				foreground: 'hsl(var(--sidebar-foreground))',
+  				primary: 'hsl(var(--sidebar-primary))',
+  				'primary-foreground': 'hsl(var(--sidebar-primary-foreground))',
+  				accent: 'hsl(var(--sidebar-accent))',
+  				'accent-foreground': 'hsl(var(--sidebar-accent-foreground))',
+  				border: 'hsl(var(--sidebar-border))',
+  				ring: 'hsl(var(--sidebar-ring))'
+  			}
+  		},
+  		fontFamily: {
+  			heading: ['var(--font-heading)'],
+  			body: ['var(--font-body)'],
+  			display: ['var(--font-display)'],
+  			mono: ['var(--font-mono)']
+  		},
+  		keyframes: {
+  			'accordion-down': {
+  				from: {
+  					height: '0'
+  				},
+  				to: {
+  					height: 'var(--radix-accordion-content-height)'
+  				}
+  			},
+  			'accordion-up': {
+  				from: {
+  					height: 'var(--radix-accordion-content-height)'
+  				},
+  				to: {
+  					height: '0'
+  				}
+  			}
+  		},
+  		animation: {
+  			'accordion-down': 'accordion-down 0.2s ease-out',
+  			'accordion-up': 'accordion-up 0.2s ease-out'
+  		}
+  	}
+  },
+  plugins: [animate],
+}
+import { readFileSync } from "node:fs";
+import base44 from "@base44/vite-plugin";
+import { cloudflare } from "@cloudflare/vite-plugin";
+import { tanstackStart } from "@tanstack/react-start/plugin/vite";
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+// Every runtime dependency is bundled at startup, for the browser and the SSR worker: one first imported
+// mid-session makes Vite re-bundle, and a page rendered meanwhile on the server loads a second React.
+// Not listed: React itself, the TanStack Start/Router framework (its plugin bundles it) and build-time plugins.
+const NOT_PREBUNDLED = new Set(["react", "react-dom", "@base44/vite-plugin", "@tanstack/react-start", "@tanstack/react-router", "@tanstack/react-router-ssr-query", "tailwindcss-animate"]);
+const { dependencies } = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
+// The SDK's realtime transports: not direct dependencies, but app code importing one would otherwise be a new one.
+const SDK_TRANSPORTS = ["partysocket", "socket.io-client"];
+const PREBUNDLE = [...Object.keys(dependencies).filter((name) => !NOT_PREBUNDLED.has(name)), ...SDK_TRANSPORTS];
+// In dev the browser otherwise fetches the router as ~100 separate files after the load event, delaying hydration
+// by seconds behind the preview proxy. Browser only, and every browser entry point of the router, so one copy loads
+// (templates/tests/tanstack-dev-router checks it).
+const BROWSER_PREBUNDLE = [
+  "@tanstack/react-router", "@tanstack/react-router/ssr/client", "@tanstack/router-core", "@tanstack/router-core/isServer",
+  "@tanstack/router-core/ssr/client",
+  "@tanstack/router-core/scroll-restoration-script", "@tanstack/history", "@tanstack/start-fn-stubs",
+  "seroval", "seroval-plugins/web", "cookie-es",
+];
+
+export default defineConfig({
+  optimizeDeps: { include: [...PREBUNDLE, ...BROWSER_PREBUNDLE] },
+  environments: {
+    ssr: {
+      optimizeDeps: { include: PREBUNDLE },
+      // Source maps for the Worker only, never served: they let Base44 point an error's stack at the app's own
+      // files. Without the sources, so the app's code isn't copied into them. The browser build gets none.
+      build: { sourcemap: true, rolldownOptions: { output: { sourcemapExcludeSources: true } } },
+    },
+  },
+  plugins: [
+    base44({
+      hmrNotifier: true,
+      navigationNotifier: true,
+      analyticsTracker: true,
+      visualEditAgent: true,
+    }),
+    // No inspector: a restarted dev server would race the old one for port 9229 and crash.
+    cloudflare({ viteEnvironment: { name: "ssr" }, inspectorPort: false }),
+    tanstackStart({ srcDirectory: "src" }),
+    react(),
+  ],
+});
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "base44-tanstack-app",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": "src/server.js"
+}
